@@ -12,13 +12,12 @@ import time
 class WhisperLiveTranscription:
     def __init__(self, model_id="openai/whisper-large-v3", language="french"):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Utilisation du device: {self.device}")
+        print(f"Using device: {self.device}")
 
         self.processor = WhisperProcessor.from_pretrained(model_id)
         self.model = WhisperForConditionalGeneration.from_pretrained(model_id).to(
             self.device
         )
-
         self.FORMAT = pyaudio.paFloat32
         self.CHANNELS = 1
         self.RATE = 16000
@@ -52,7 +51,7 @@ class WhisperLiveTranscription:
             stream_callback=audio_callback,
         )
 
-        print("Enregistrement démarré")
+        print("Recording started")
         self.stream.start_stream()
 
         self.process_thread = threading.Thread(target=self._process_audio)
@@ -64,14 +63,14 @@ class WhisperLiveTranscription:
         while self.is_running:
             try:
                 raw_chunk = self.audio_queue.get(timeout=1)
-                audio_chunk = raw_chunk  # Pas de traitement
+                audio_chunk = raw_chunk
 
                 if np.max(np.abs(audio_chunk)) > self.SILENCE_THRESHOLD:
                     self.audio_buffer.extend(audio_chunk)
 
                 current_time = time.time()
                 if current_time - self.last_process_time >= self.RECORD_SECONDS:
-                    if len(self.audio_buffer) > 0:
+                    if self.audio_buffer:
                         audio_data = np.array(self.audio_buffer)
                         self.result_queue.put(audio_data)
                         self.audio_buffer = []
@@ -81,7 +80,7 @@ class WhisperLiveTranscription:
                 continue
 
     def _transcribe_audio(self):
-        while self.is_running:
+        while self.is_running or not self.result_queue.empty():
             try:
                 audio_data = self.result_queue.get(timeout=1)
                 input_features = self.processor(
@@ -107,11 +106,11 @@ class WhisperLiveTranscription:
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f"Erreur lors de la transcription: {e}")
+                print(f"Error during transcription: {e}")
                 continue
 
     def stop_recording(self):
-        print("\nArrêt en cours... Traitement des derniers segments audio...")
+        print("\nStopping... Processing last audio segments...")
 
         if hasattr(self, "stream"):
             self.stream.stop_stream()
@@ -119,7 +118,7 @@ class WhisperLiveTranscription:
         if hasattr(self, "p"):
             self.p.terminate()
 
-        if len(self.audio_buffer) > 0:
+        if self.audio_buffer:
             final_audio = np.array(self.audio_buffer)
             self.result_queue.put(final_audio)
 
@@ -129,7 +128,7 @@ class WhisperLiveTranscription:
             chunk = self.audio_queue.get()
             self.audio_buffer.extend(chunk)
 
-        if len(self.audio_buffer) > 0:
+        if self.audio_buffer:
             final_audio = np.array(self.audio_buffer)
             self.result_queue.put(final_audio)
 
@@ -139,31 +138,29 @@ class WhisperLiveTranscription:
             timeout = 5
             self.transcribe_thread.join(timeout=timeout)
             if self.transcribe_thread.is_alive():
-                print(
-                    "Attention: La dernière transcription n'a pas pu être terminée dans le temps imparti"
-                )
+                print("Warning: Last transcription could not be completed in time")
 
-        print("Enregistrement et transcription terminés")
+        print("Recording and transcription stopped")
 
     def save_audio(self, filename):
-        if len(self.audio_buffer) > 0:
+        if self.audio_buffer:
             wf = wave.open(filename, "wb")
             wf.setnchannels(self.CHANNELS)
             wf.setsampwidth(self.p.get_sample_size(self.FORMAT))
             wf.setframerate(self.RATE)
             wf.writeframes(b"".join(self.audio_buffer))
             wf.close()
-            print(f"Audio sauvegardé dans {filename}")
+            print(f"Audio saved to {filename}")
 
 
 if __name__ == "__main__":
     try:
         transcriber = WhisperLiveTranscription(
-            model_id="openai/whisper-medium", language="french"
+            model_id="openai/whisper-large-v3-turbo", language="french"
         )
         transcriber.start_recording()
 
-        print("Appuyez sur Ctrl+C pour arrêter...")
+        print("Press Ctrl+C to stop...")
         while True:
             time.sleep(0.1)
 
@@ -171,7 +168,7 @@ if __name__ == "__main__":
         try:
             transcriber.stop_recording()
         except Exception as e:
-            print(f"Erreur lors de l'arrêt: {e}")
+            print(f"Error stopping: {e}")
         finally:
             if hasattr(transcriber, "p"):
                 try:
