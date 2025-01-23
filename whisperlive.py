@@ -27,6 +27,9 @@ class WhisperLiveTranscription:
 
         self.audio_queue = queue.Queue()
         self.result_queue = queue.Queue()
+        self.transcription_queue = (
+            queue.Queue()
+        )  # New queue for transcription retrieval
         self.is_running = False
         self.language = language
 
@@ -103,11 +106,35 @@ class WhisperLiveTranscription:
                 timestamp = datetime.now().strftime("%H:%M:%S")
                 print(f"[{timestamp}] {transcription}")
 
+                # Add transcription to the new queue
+                self.transcription_queue.put(
+                    {"text": transcription, "timestamp": timestamp}
+                )
+
             except queue.Empty:
                 continue
             except Exception as e:
                 print(f"Error during transcription: {e}")
                 continue
+
+    def get_transcription(self, block=False, timeout=None):
+        """
+        Retrieve transcriptions from the queue.
+
+        Args:
+            block (bool): Whether to block if no transcription is available
+            timeout (float, optional): Maximum time to wait for a transcription
+
+        Returns:
+            dict or None: A dictionary with 'text' and 'timestamp' keys, or None if no transcription is available
+        """
+        try:
+            if block:
+                return self.transcription_queue.get(block=True, timeout=timeout)
+            else:
+                return self.transcription_queue.get_nowait()
+        except queue.Empty:
+            return None
 
     def stop_recording(self):
         print("\nStopping... Processing last audio segments...")
@@ -154,10 +181,19 @@ class WhisperLiveTranscription:
 
 
 if __name__ == "__main__":
+    # Modèles possibles :
+    model_ids = [
+        "openai/whisper-tiny",
+        "openai/whisper-base",
+        "openai/whisper-small",
+        "openai/whisper-medium",
+        "openai/whisper-large",
+        "openai/whisper-large-v2",
+        "openai/whisper-large-v3",
+        "openai/whisper-large-v3-turbo",
+    ]
     try:
-        transcriber = WhisperLiveTranscription(
-            model_id="openai/whisper-large-v3-turbo", language="french"
-        )
+        transcriber = WhisperLiveTranscription(model_id=model_ids[7], language="french")
         transcriber.start_recording()
 
         print("Press Ctrl+C to stop...")
