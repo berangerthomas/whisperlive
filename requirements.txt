@@ -102,3 +102,6 @@ wcwidth @ file:///home/conda/feedstock_root/build_artifacts/wcwidth_173323132628
 xxhash==3.5.0
 yarl==1.18.3
 zipp @ file:///home/conda/feedstock_root/build_artifacts/zipp_1732827521216/work
+pyannote.audio
+speechbrain
+python-dotenv
