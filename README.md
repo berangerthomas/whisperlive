@@ -95,12 +95,14 @@ To transcribe an existing audio file, use the `--file` argument. The file should
 ```bash
 python whisperlive.py --model openai/whisper-medium --language english --file "path/to/your/audio.wav"
 ```
+The output will be saved to a descriptive file, such as `your_audio_transcription_openai_whisper-medium_thresh0.60.txt`, which includes the original filename, the model used, and the similarity threshold.
 
 ### Command-Line Arguments
 
 *   `--model` (optional): Whisper model to use. Default: `openai/whisper-small`. Larger models are more accurate but slower.
 *   `--language` (optional): Language of the audio (e.g., `french`, `english`). Default: `french`.
 *   `--file` (optional): Path to the audio file to transcribe. If omitted, the script enters live mode.
+*   `--threshold` (optional): Similarity threshold for speaker identification (0.0 to 1.0). Lower is less strict. Default: `0.60`.
 
 ## Configuration and Tuning
 
@@ -109,17 +111,13 @@ python whisperlive.py --model openai/whisper-medium --language english --file "p
 If you find the system is creating too many unique speakers (e.g., `Speaker_3`, `Speaker_4` for the same person), the similarity threshold is likely too strict.
 
 *   **What it is**: The `similarity_threshold` is a value between 0 and 1 that determines how similar a new voice segment must be to an existing speaker's voiceprint to be matched with them.
-*   **The Problem**: A high threshold (e.g., 0.65) is very strict. Minor variations in a person's voice can cause the similarity score to drop below the threshold, creating a new speaker ID unnecessarily.
-*   **The Solution**: To make the system more tolerant and group speakers more effectively, **lower the threshold**.
+*   **The Problem**: A high threshold is very strict. Minor variations in a person's voice can cause the similarity score to drop below the threshold, creating a new speaker ID unnecessarily.
+*   **The Solution**: To make the system more tolerant and group speakers more effectively, **lower the threshold** using the `--threshold` command-line argument.
 
-You can change this value directly in the `whisperlive.py` script:
-
-```python
-# In the __init__ method of the WhisperLiveTranscription class
-self.similarity_threshold = 0.60  # Default is 0.65. Lower it to be less strict.
+```bash
+python whisperlive.py --file "path/to/your/audio.wav" --threshold 0.55
 ```
-
-Good values to test are between `0.55` and `0.60`.
+Good values to test are between `0.50` and `0.60`. Experiment to find the best balance for your audio.
 
 ## Contribution
 

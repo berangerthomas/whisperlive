@@ -37,8 +37,17 @@ from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
 
 class WhisperLiveTranscription:
-    def __init__(self, model_id="openai/whisper-large-v3-turbo", language="french"):
+    def __init__(
+        self,
+        model_id="openai/whisper-large-v3-turbo",
+        language="french",
+        similarity_threshold=0.60,
+    ):
         print("Launching WhisperLiveTranscription...")
+
+        # Store configuration
+        self.model_id = model_id
+        self.language = language
 
         # Load environment variables
         load_dotenv()
@@ -82,7 +91,7 @@ class WhisperLiveTranscription:
         # Speaker registry for re-identification
         self.speaker_registry = {}
         self.next_speaker_id = 1
-        self.similarity_threshold = 0.60  # Le diminuer pour être moins strict
+        self.similarity_threshold = similarity_threshold
 
         # Audio configuration
         self._setup_audio_config()
@@ -93,11 +102,10 @@ class WhisperLiveTranscription:
         # Runtime state
         self.chunk_timestamps = {}
         self.chunk_counter = 0
-        self.language = language
         self.is_running = False
         self.start_time = None
 
-        # Output file
+        # Output file - Default name for live mode
         self.filename = f"transcription_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         self._init_output_file()
 
@@ -419,6 +427,15 @@ class WhisperLiveTranscription:
         Transcribe an entire audio file by chunking it and processing it
         like a live stream.
         """
+        # Generate a descriptive filename for file transcription
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        model_name_safe = self.model_id.replace("/", "_")
+        threshold_str = f"thresh{self.similarity_threshold:.2f}"
+        self.filename = (
+            f"{base_name}_transcription_{model_name_safe}_{threshold_str}.txt"
+        )
+        self._init_output_file()
+
         print(f"Transcribing audio file: {file_path}")
         try:
             with wave.open(file_path, "rb") as wf:
@@ -472,10 +489,8 @@ class WhisperLiveTranscription:
 
             # 4. Wait for the worker thread to finish processing all chunks
             print("All segments queued. Waiting for final processing...")
-            self.transcribe_thread.join(timeout=300)  # Wait up to 5 minutes
-
-            # 5. Force process any remaining items just in case
-            self._force_final_transcription()
+            if hasattr(self, "transcribe_thread"):
+                self.transcribe_thread.join()  # Remove timeout to wait as long as needed
 
             print(f"\nTranscription finished. Results saved to {self.filename}")
 
@@ -685,12 +700,20 @@ if __name__ == "__main__":
         default=None,
         help="Path to a WAV audio file to transcribe. If not provided, runs in live mode.",
     )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.60,
+        help="Similarity threshold for speaker identification (0.0 to 1.0). Lower is less strict.",
+    )
 
     args = parser.parse_args()
 
     try:
         transcriber = WhisperLiveTranscription(
-            model_id=args.model, language=args.language
+            model_id=args.model,
+            language=args.language,
+            similarity_threshold=args.threshold,
         )
 
         if args.file:
@@ -711,11 +734,31 @@ if __name__ == "__main__":
                 time.sleep(0.1)
 
     except KeyboardInterrupt:
-        if not args.file:
-            print("\nStopping...")
-            transcriber.stop_recording()
-            transcriber.save_audio()
+        print("\nStopping process...")
+        # Ensure transcriber object exists before trying to use it
+        if "transcriber" in locals():
+            # Signal the worker thread to stop its loop
+            transcriber.is_running = False
+
+            # Wait for the worker thread to finish its current task
+            if (
+                hasattr(transcriber, "transcribe_thread")
+                and transcriber.transcribe_thread.is_alive()
+            ):
+                print("Waiting for transcription thread to finalize...")
+                transcriber.transcribe_thread.join(timeout=10)
+
+            # Specific cleanup for live mode (stream and audio saving)
+            if not args.file:
+                # The stream needs to be explicitly closed if it was running
+                if hasattr(transcriber, "stream") and transcriber.stream.is_active():
+                    transcriber.stream.stop_stream()
+                if hasattr(transcriber, "audio_context"):
+                    transcriber.audio_context.__exit__(None, None, None)
+                transcriber.save_audio()
+
         print("Done.")
+
     except Exception as e:
         print(f"Error: {e}")
         traceback.print_exc()
