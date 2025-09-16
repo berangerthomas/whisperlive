@@ -4,13 +4,15 @@ This project provides a real-time audio transcription solution with speaker diar
 
 ## Features
 
+*   **Dual Processing Modes**:
+    *   **`subtitle` mode**: Generates short, time-accurate segments ideal for live subtitling.
+    *   **`transcription` mode**: Intelligently merges consecutive speech segments from the same speaker to produce a fluid, readable transcript, perfect for reports and documentation.
 *   **Real-Time Transcription**: Transcribes speech live from the microphone.
 *   **File Transcription**: Processes and transcribes long pre-recorded audio files efficiently.
 *   **Speaker Diarization**: Detects who is speaking and when (`pyannote/speaker-diarization-3.1`).
 *   **Speaker Re-identification**: Assigns a unique and consistent ID to each detected speaker, even across audio segments (`speechbrain/spkrec-ecapa-voxceleb`).
-*   **Intelligent Audio Segmentation**: Uses silence detection to segment audio naturally, improving transcription quality.
 *   **Timestamped Output**: Generates a clean transcription with timestamps and speaker IDs for each speech segment.
-*   **Audio Export**: Saves the entire audio session to a `.wav` file at the end of the recording.
+*   **Audio Export**: Saves the entire audio session to a `.wav` file at the end of the recording (live mode only).
 *   **Performance Optimized**: Uses `torch.compile` and `float16` precision on compatible GPUs for maximum performance.
 
 ## Technical Architecture
@@ -20,6 +22,7 @@ The system is built around several key technologies:
 *   **Transcription Model**: Uses OpenAI's **Whisper** model family via the Hugging Face `transformers` library for high-quality speech recognition.
 *   **Diarization Pipeline**: Employs **`pyannote.audio`** to segment the audio and assign local speaker tags to each turn of speech.
 *   **Speaker Recognition**: Uses **`speechbrain`** (the `spkrec-ecapa-voxceleb` model) to create embeddings (voiceprints) from speech segments. These embeddings are compared to re-identify speakers consistently throughout the session.
+*   **Segment Merging Logic**: A crucial step where speech segments are processed based on the selected mode. In `transcription` mode, consecutive segments from the same identified speaker are merged to form coherent paragraphs, ignoring silence gaps. In `subtitle` mode, segments remain short to ensure precise timing.
 *   **Audio Capture**: Manages the real-time audio stream with **`pyaudio`**, chunking it into segments for processing.
 *   **Parallel Processing**: Uses threads to separate audio capture from transcription, ensuring low latency and a responsive interface.
 *   **Computation**: The script is optimized to use a GPU (CUDA) if available, which significantly speeds up model processing. It also runs on CPU.
@@ -28,10 +31,7 @@ The system is built around several key technologies:
 
 ### Prerequisites
 
-*   Python 3.8+
-*   Git
-*   A **NVIDIA GPU** with CUDA support is strongly recommended for real-time performance.
-*   **For Windows users**: [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) are required for some dependencies.
+*   Python 3.9+
 *   **For Linux users**: `portaudio` development files might be needed (`sudo apt-get install portaudio19-dev`).
 
 ### Installation Steps
@@ -74,14 +74,18 @@ The system is built around several key technologies:
 
 ## Usage
 
-The script can be run in two modes: live transcription or file processing.
+The script can be run in two modes: live transcription or file processing. The `--mode` argument allows you to choose the output format.
 
 ### 1. Live Transcription (from microphone)
 
 To start real-time transcription, run the script without the `--file` argument.
 
 ```bash
-python whisperlive.py --model openai/whisper-small --language english
+# For a fluid, paragraph-style transcript
+python whisperlive.py --model openai/whisper-small --language english --mode transcription
+
+# For live, time-accurate subtitles
+python whisperlive.py --model openai/whisper-small --language english --mode subtitle
 ```
 
 *   The program will start listening and transcribing.
@@ -90,10 +94,11 @@ python whisperlive.py --model openai/whisper-small --language english
 
 ### 2. Transcription from a File
 
-To transcribe an existing audio file, use the `--file` argument. The file should be a **16kHz mono WAV file** for best results.
+To transcribe an existing audio file, use the `--file` argument.
 
 ```bash
-python whisperlive.py --model openai/whisper-medium --language english --file "path/to/your/audio.wav"
+# Generate a clean report from a meeting recording
+python whisperlive.py --model openai/whisper-medium --language english --file "path/to/your/audio.wav" --mode transcription
 ```
 The output will be saved to a descriptive file, such as `your_audio_transcription_openai_whisper-medium_thresh0.60.txt`, which includes the original filename, the model used, and the similarity threshold.
 
@@ -101,10 +106,16 @@ The output will be saved to a descriptive file, such as `your_audio_transcriptio
 
 *   `--model` (optional): Whisper model to use. Default: `openai/whisper-small`. Larger models are more accurate but slower.
 *   `--language` (optional): Language of the audio (e.g., `french`, `english`). Default: `french`.
+*   `--mode` (optional): Output mode. Can be `subtitle` (default) or `transcription`.
 *   `--file` (optional): Path to the audio file to transcribe. If omitted, the script enters live mode.
 *   `--threshold` (optional): Similarity threshold for speaker identification (0.0 to 1.0). Lower is less strict. Default: `0.60`.
 
 ## Configuration and Tuning
+
+### Choosing the Right Mode
+
+*   Use **`--mode subtitle`** when you need precise timing for each short phrase, such as for creating video subtitles or monitoring a live conversation turn-by-turn.
+*   Use **`--mode transcription`** when your goal is a final, readable document, like a meeting summary or an article. This mode prioritizes text flow over exact timing of short pauses.
 
 ### Adjusting Speaker Identification
 

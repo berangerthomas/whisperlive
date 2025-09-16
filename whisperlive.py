@@ -27,13 +27,11 @@ warnings.filterwarnings(
 # Set environment variable to disable HuggingFace symlink warnings
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
-# --- AJOUTS POUR LA DIARISATION ET LES EMBEDDINGS ---
 from pyannote.audio import Pipeline
+from pyannote.core import Segment
 from scipy.spatial.distance import cosine
 from speechbrain.inference import SpeakerRecognition
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
-
-# ----------------------------------------------------
 
 
 class WhisperLiveTranscription:
@@ -42,12 +40,15 @@ class WhisperLiveTranscription:
         model_id="openai/whisper-large-v3-turbo",
         language="french",
         similarity_threshold=0.60,
+        mode="subtitle",
     ):
         print("Launching WhisperLiveTranscription...")
 
         # Store configuration
         self.model_id = model_id
         self.language = language
+        self.mode = mode
+        self.max_merge_gap = 1.5  # Max silence in seconds between segments to merge
 
         # Load environment variables
         load_dotenv()
@@ -92,6 +93,7 @@ class WhisperLiveTranscription:
         self.speaker_registry = {}
         self.next_speaker_id = 1
         self.similarity_threshold = similarity_threshold
+        print(f"DEBUG: Configured similarity threshold: {self.similarity_threshold}")
 
         # Audio configuration
         self._setup_audio_config()
@@ -106,7 +108,9 @@ class WhisperLiveTranscription:
         self.start_time = None
 
         # Output file - Default name for live mode
-        self.filename = f"transcription_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        self.filename = (
+            f"transcription_{self.mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        )
         self._init_output_file()
 
         # Pre-calculate forced_decoder_ids - Updated to use task and language parameters
@@ -231,6 +235,7 @@ class WhisperLiveTranscription:
             speaker_id = f"Speaker_{self.next_speaker_id}"
             self.speaker_registry[speaker_id] = embedding
             self.next_speaker_id += 1
+            print(f"DEBUG: Created new speaker {speaker_id} (first speaker)")
             return speaker_id
 
         # Compare with existing speakers
@@ -239,21 +244,28 @@ class WhisperLiveTranscription:
 
         for speaker_id, stored_embedding in self.speaker_registry.items():
             similarity = 1 - cosine(embedding.flatten(), stored_embedding.flatten())
+            print(f"DEBUG: Comparing with {speaker_id}: similarity = {similarity:.4f}")
             if similarity > best_similarity:
                 best_similarity = similarity
                 best_match = speaker_id
+
+        print(
+            f"DEBUG: Best match: {best_match} with similarity {best_similarity:.4f}, threshold: {self.similarity_threshold}"
+        )
 
         if best_similarity > self.similarity_threshold:
             # Update embedding with running average
             self.speaker_registry[best_match] = (
                 self.speaker_registry[best_match] * 0.7 + embedding * 0.3
             )
+            print(f"DEBUG: Assigned to existing speaker {best_match}")
             return best_match
         else:
             # New speaker
             speaker_id = f"Speaker_{self.next_speaker_id}"
             self.speaker_registry[speaker_id] = embedding
             self.next_speaker_id += 1
+            print(f"DEBUG: Created new speaker {speaker_id} (similarity too low)")
             return speaker_id
 
     def get_transcription(self):
@@ -348,79 +360,252 @@ class WhisperLiveTranscription:
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
     def _process_transcription(self, chunk_id, audio_data, is_final=False):
-        """Process transcription with diarization and speaker identification."""
-        if not self._should_process_segment(audio_data):
-            if chunk_id in self.chunk_timestamps:
-                del self.chunk_timestamps[chunk_id]
-            return
-
-        ts_data = self.chunk_timestamps.get(chunk_id)
-        segment_start_time_seconds = ts_data["start"] if ts_data else 0
-
+        """Process a chunk of audio: diarize, identify, and transcribe."""
         print(f"Processing segment {chunk_id}...")
 
-        # Prepare audio for diarization
-        audio_for_diarization = {
-            "waveform": torch.from_numpy(audio_data).unsqueeze(0),
-            "sample_rate": self.RATE,
-        }
-
         try:
-            # Suppress pooling warnings from pyannote
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore", message=".*std\\(\\): degrees of freedom.*"
+            diarization_result = self.diarization_pipeline(
+                {
+                    "waveform": torch.from_numpy(audio_data).unsqueeze(0),
+                    "sample_rate": self.RATE,
+                }
+            )
+
+            # Count segments and unique speakers separately
+            segments = list(diarization_result.itertracks(yield_label=True))
+            unique_speakers = set(speaker_label for _, _, speaker_label in segments)
+
+            print(
+                f"Found {len(segments)} speech segments from {len(unique_speakers)} speakers in segment {chunk_id}"
+            )
+
+            # --- MODE SELECTION LOGIC ---
+            if self.mode == "transcription":
+                # --- TRANSCRIPTION MODE: Merge segments before transcribing ---
+                merged_segments = self._merge_speaker_segments(
+                    diarization_result, audio_data
                 )
-                diarization = self.diarization_pipeline(audio_for_diarization)
-        except Exception as e:
-            print(f"Diarization failed for chunk {chunk_id}: {e}")
-            return
+                for segment_info in merged_segments:
+                    self._transcribe_and_display(segment_info)
+            else:
+                # --- SUBTITLE MODE: Transcribe each segment individually (original behavior) ---
+                for turn, _, speaker_label in diarization_result.itertracks(
+                    yield_label=True
+                ):
+                    speaker_audio_segment = audio_data[
+                        int(turn.start * self.RATE) : int(turn.end * self.RATE)
+                    ]
+                    segment_info = {
+                        "speaker_label": speaker_label,
+                        "turn": turn,
+                        "audio_segment": speaker_audio_segment,
+                    }
+                    self._transcribe_and_display(segment_info)
 
-        print(f"Found {len(diarization.labels())} speakers in segment {chunk_id}")
+        except Exception:
+            print(f"Error during transcription of segment {chunk_id}:")
+            traceback.print_exc()
+        finally:
+            if chunk_id in self.chunk_timestamps:
+                del self.chunk_timestamps[chunk_id]
 
-        for turn, _, local_speaker_label in diarization.itertracks(yield_label=True):
-            start_sample = int(turn.start * self.RATE)
-            end_sample = int(turn.end * self.RATE)
-            speaker_audio_segment = audio_data[start_sample:end_sample]
+    def _merge_speaker_segments(self, diarization_result, audio_data):
+        """
+        Two-step approach: First identify speakers for each segment, then merge consecutive segments.
+        This is more robust than trying to merge and identify simultaneously.
+        """
+        merged_segments = []
+        timeline = diarization_result.get_timeline().support()
+        if not timeline:
+            return merged_segments
 
-            if len(speaker_audio_segment) < self.RATE * 0.5:
+        # Get the list of turns sorted by start time
+        turns = list(diarization_result.itertracks(yield_label=True))
+        if not turns:
+            return merged_segments
+
+        # --- STEP 1: IDENTIFY SPEAKERS FOR EACH SEGMENT ---
+        identified_segments = []
+        for turn, _, pyannote_speaker in turns:
+            # Extract audio for this individual segment
+            start_samples = int(turn.start * self.RATE)
+            end_samples = int(turn.end * self.RATE)
+            audio_segment = audio_data[start_samples:end_samples]
+
+            # Skip segments that are too short for reliable speaker identification
+            if len(audio_segment) < self.RATE * 0.5:  # Minimum 0.5 seconds
+                print(
+                    f"DEBUG: Skipping short segment {turn.start:.2f}s-{turn.end:.2f}s"
+                )
                 continue
 
-            # Generate speaker embedding
-            with torch.no_grad():
+            # Get speaker embedding and identify
+            try:
                 embedding = self.embedding_model.encode_batch(
-                    torch.from_numpy(speaker_audio_segment).unsqueeze(0).to(self.device)
+                    torch.from_numpy(audio_segment).unsqueeze(0).to(self.device)
                 )
-                embedding = embedding.squeeze().cpu().numpy()
+                assigned_speaker = self._get_speaker_id(embedding.squeeze())
 
-            global_speaker_id = self._get_speaker_id(embedding.reshape(1, -1))
-
-            speaker_turn_start_time = segment_start_time_seconds + turn.start
-            transcription = self._transcribe_segment(speaker_audio_segment)
-
-            if transcription.strip():
-                timestamp_str = self._calculate_video_timestamp(speaker_turn_start_time)
-                formatted_text = (
-                    f"[{timestamp_str}][{global_speaker_id}] {transcription}"
+                identified_segments.append(
+                    {
+                        "turn": turn,
+                        "pyannote_speaker": pyannote_speaker,
+                        "assigned_speaker": assigned_speaker,
+                        "audio_segment": audio_segment,
+                    }
+                )
+                print(
+                    f"DEBUG: Identified segment {turn.start:.2f}s-{turn.end:.2f}s as {assigned_speaker} (pyannote: {pyannote_speaker})"
                 )
 
-                with open(self.filename, "a", encoding="utf-8") as f:
-                    f.write(formatted_text + "\n")
+            except Exception as e:
+                print(
+                    f"DEBUG: Failed to identify speaker for segment {turn.start:.2f}s-{turn.end:.2f}s: {e}"
+                )
+                continue
 
-                prefix = "Final" if is_final else "Live"
-                print(f"{prefix}: {formatted_text}")
+        # --- STEP 2: MERGE CONSECUTIVE SEGMENTS FROM THE SAME IDENTIFIED SPEAKER ---
+        if not identified_segments:
+            return merged_segments
 
-                if not is_final:
-                    self.transcription_queue.put(
-                        {
-                            "text": transcription,
-                            "timestamp": timestamp_str,
-                            "speaker": global_speaker_id,
-                        }
+        # --- IMPROVED GROUPING LOGIC WITH SPEAKER INTERRUPTION DETECTION ---
+        merged_groups = []
+        if identified_segments:
+            current_group = [identified_segments[0]]
+
+            for i in range(1, len(identified_segments)):
+                current_segment = identified_segments[i]
+                last_segment_in_group = current_group[-1]
+
+                same_speaker = (
+                    current_segment["assigned_speaker"]
+                    == last_segment_in_group["assigned_speaker"]
+                )
+                time_gap = (
+                    current_segment["turn"].start - last_segment_in_group["turn"].end
+                )
+
+                # --- SIMPLIFIED LOGIC FOR TRANSCRIPTION MODE ---
+                if self.mode == "transcription":
+                    # In transcription mode, merge all consecutive segments from same speaker
+                    # regardless of gap duration
+                    should_merge = same_speaker
+                    gap_reason = f"gap: {time_gap:.2f}s (ignored in transcription mode)"
+                else:
+                    # In subtitle mode, respect the time gap limit
+                    should_merge = same_speaker and time_gap < self.max_merge_gap
+                    gap_reason = f"gap: {time_gap:.2f}s (limit: {self.max_merge_gap}s)"
+
+                print(
+                    f"DEBUG: Comparing segment {current_segment['turn'].start:.2f}s ({current_segment['assigned_speaker']}) with last in group {last_segment_in_group['turn'].end:.2f}s ({last_segment_in_group['assigned_speaker']}) - {gap_reason}"
+                )
+
+                if should_merge:
+                    # Merge: add to current group
+                    current_group.append(current_segment)
+                    print(
+                        f"DEBUG: ✓ Merging segment {current_segment['turn'].start:.2f}s-{current_segment['turn'].end:.2f}s with group (gap: {time_gap:.2f}s)"
+                    )
+                else:
+                    # Finalize current group and start new one
+                    merged_groups.append(current_group)
+                    reason = (
+                        "different speaker"
+                        if not same_speaker
+                        else f"gap too large ({time_gap:.2f}s)"
+                    )
+                    print(
+                        f"DEBUG: ✗ Finalizing group with {len(current_group)} segments for {current_group[0]['assigned_speaker']} ({reason})"
+                    )
+                    current_group = [current_segment]
+                    print(
+                        f"DEBUG: Starting new group for {current_segment['assigned_speaker']} at {current_segment['turn'].start:.2f}s"
                     )
 
-        if chunk_id in self.chunk_timestamps:
-            del self.chunk_timestamps[chunk_id]
+            # Add the last group
+            merged_groups.append(current_group)
+            print(
+                f"DEBUG: Final group with {len(current_group)} segments for {current_group[0]['assigned_speaker']}"
+            )
+        # ----------------------------------------------------------------
+
+        # --- STEP 3: CREATE FINAL SEGMENTS WITH MERGED AUDIO ---
+        for group_idx, group in enumerate(merged_groups):
+            if not group:
+                continue
+
+            speaker_id = group[0]["assigned_speaker"]
+            start_time = group[0]["turn"].start
+            end_time = group[-1]["turn"].end
+
+            # Concatenate audio from all segments in this group
+            audio_chunks = [segment["audio_segment"] for segment in group]
+            merged_audio = np.concatenate(audio_chunks)
+
+            print(
+                f"DEBUG: Group {group_idx + 1}: Created merged segment for {speaker_id}: {start_time:.2f}s-{end_time:.2f}s ({len(group)} segments, {len(merged_audio) / self.RATE:.2f}s audio)"
+            )
+
+            merged_segments.append(
+                {
+                    "speaker_label": speaker_id,  # Use the identified speaker, not pyannote label
+                    "turn": Segment(start_time, end_time),
+                    "audio_segment": merged_audio,
+                }
+            )
+
+        print(
+            f"DEBUG: Final result: {len(merged_groups)} groups -> {len(merged_segments)} merged segments"
+        )
+        return merged_segments
+
+    def _transcribe_and_display(self, segment_info):
+        """Helper function to handle transcription and display for a segment."""
+        turn = segment_info["turn"]
+        speaker_label = segment_info[
+            "speaker_label"
+        ]  # This is now the identified speaker ID
+        speaker_audio_segment = segment_info["audio_segment"]
+
+        # --- FILTER OUT SEGMENTS TOO SHORT FOR PROCESSING ---
+        min_duration = 0.5  # Minimum 0.5 seconds
+        min_samples = int(min_duration * self.RATE)
+
+        if len(speaker_audio_segment) < min_samples:
+            print(
+                f"DEBUG: Skipping segment too short: {len(speaker_audio_segment)} samples ({len(speaker_audio_segment) / self.RATE:.2f}s)"
+            )
+            return
+        # ---------------------------------------------------
+
+        # --- SIMPLIFIED LOGGING (no embedding calculation needed here) ---
+        print(f"DEBUG: Transcribing merged segment for {speaker_label}")
+        print(
+            f"DEBUG: Turn: {turn.start:.2f}s -> {turn.end:.2f}s (duration: {turn.end - turn.start:.2f}s)"
+        )
+        print(
+            f"DEBUG: Audio segment length: {len(speaker_audio_segment)} samples ({len(speaker_audio_segment) / self.RATE:.2f}s)"
+        )
+        # ---------------------------------------------------------------
+
+        # Transcribe (no need to identify speaker again, it's already done)
+        transcription = self._transcribe_segment(speaker_audio_segment)
+        if not transcription or transcription.isspace():
+            print("DEBUG: Transcription was empty or whitespace only")
+            return
+
+        # Calculate timestamp
+        chunk_start_time = self.chunk_timestamps.get(self.chunk_counter - 1, {}).get(
+            "start", 0
+        )
+        elapsed_seconds = chunk_start_time + turn.start
+        timestamp = self._calculate_video_timestamp(elapsed_seconds)
+
+        # Format and save
+        line = f"[{timestamp}][{speaker_label}] {transcription}\n"
+        print(f"Live: {line.strip()}")
+        with open(self.filename, "a", encoding="utf-8") as f:
+            f.write(line)
 
     def transcribe_file(self, file_path):
         """
@@ -431,9 +616,7 @@ class WhisperLiveTranscription:
         base_name = os.path.splitext(os.path.basename(file_path))[0]
         model_name_safe = self.model_id.replace("/", "_")
         threshold_str = f"thresh{self.similarity_threshold:.2f}"
-        self.filename = (
-            f"{base_name}_transcription_{model_name_safe}_{threshold_str}.txt"
-        )
+        self.filename = f"{base_name}_{self.mode}_{model_name_safe}_{threshold_str}.txt"
         self._init_output_file()
 
         print(f"Transcribing audio file: {file_path}")
@@ -706,6 +889,13 @@ if __name__ == "__main__":
         default=0.60,
         help="Similarity threshold for speaker identification (0.0 to 1.0). Lower is less strict.",
     )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["subtitle", "transcription"],
+        default="subtitle",
+        help='Processing mode: "subtitle" for real-time display, "transcription" for merged, fluid text.',
+    )
 
     args = parser.parse_args()
 
@@ -714,6 +904,7 @@ if __name__ == "__main__":
             model_id=args.model,
             language=args.language,
             similarity_threshold=args.threshold,
+            mode=args.mode,
         )
 
         if args.file:
