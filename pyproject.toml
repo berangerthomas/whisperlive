@@ -1,0 +1,14 @@
+[project]
+name = "whisperlive"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pyannote-audio>=3.4.0",
+    "pyaudio>=0.2.14",
+    "python-dotenv>=1.1.1",
+    "speechbrain>=1.0.3",
+    "torch>=2.8.0",
+    "transformers>=4.56.1",
+]
