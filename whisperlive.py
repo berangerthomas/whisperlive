@@ -874,7 +874,7 @@ if __name__ == "__main__":
         "--model",
         type=str,
         choices=MODELS,
-        default="openai/whisper-small",
+        default="openai/whisper-large-v3-turbo",
         help="Whisper model to use for transcription.",
     )
     parser.add_argument(
@@ -886,7 +886,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.60,
+        default=0.50,
         help="Similarity threshold for speaker identification (0.0 to 1.0). Lower is less strict.",
     )
     parser.add_argument(
