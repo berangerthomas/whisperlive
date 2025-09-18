@@ -32,36 +32,37 @@ The system is built around several key technologies:
 ### Prerequisites
 
 *   Python 3.9+
+*   [uv](https://github.com/astral-sh/uv), an extremely fast Python package installer and resolver.
 *   **For Linux users**: `portaudio` development files might be needed (`sudo apt-get install portaudio19-dev`).
 
 ### Installation Steps
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/your-username/whisperlive.git
+    git clone https://github.com/berangerthomas/whisperlive.git
     cd whisperlive
     ```
 
-2.  **Create a virtual environment (recommended):**
+2.  **Create a virtual environment and install dependencies with `uv`:**
+    This command creates a `.venv` virtual environment and installs all dependencies listed in `pyproject.toml`.
     ```bash
-    python -m venv venv
-    source venv/bin/activate  # On Windows: venv\Scripts\activate
+    uv venv
+    uv sync
+    ```
+    Then, activate the environment:
+    ```bash
+    source .venv/bin/activate  # On Windows: .venv\Scripts\activate
     ```
 
-3.  **Install PyTorch:**
-    Install PyTorch first, following the official instructions for your specific CUDA version to ensure GPU acceleration.
+3.  **Install PyTorch (for GPU acceleration):**
+    To benefit from GPU acceleration, install the PyTorch version matching your CUDA version. `uv` can handle this using the appropriate index URL.
     ```bash
     # Example for CUDA 12.1
-    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+    uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
     ```
+    If you don't have a GPU, the PyTorch version installed by `uv sync` is sufficient.
 
-4.  **Install Python dependencies:**
-    Install the remaining packages from the `requirements.txt` file.
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-5.  **Configure Hugging Face Access:**
+4.  **Configure Hugging Face Access:**
     Diarization with `pyannote/speaker-diarization-3.1` requires authentication with Hugging Face.
     *   Create an account on [Hugging Face](https://huggingface.co/).
     *   Accept the terms of use for the [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) and [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) models on their respective pages.
@@ -82,7 +83,7 @@ To start real-time transcription, run the script without the `--file` argument.
 
 ```bash
 # For a fluid, paragraph-style transcript
-python whisperlive.py --model openai/whisper-small --language english --mode transcription
+python whisperlive.py --model openai/whisper-large-v3-turbo --language english --mode transcription
 
 # For live, time-accurate subtitles
 python whisperlive.py --model openai/whisper-small --language english --mode subtitle
@@ -98,13 +99,13 @@ To transcribe an existing audio file, use the `--file` argument.
 
 ```bash
 # Generate a clean report from a meeting recording
-python whisperlive.py --model openai/whisper-medium --language english --file "path/to/your/audio.wav" --mode transcription
+python whisperlive.py --model openai/whisper-large-v3-turbo --language english --file "path/to/your/audio.wav" --mode transcription --threshold 0.2
 ```
-The output will be saved to a descriptive file, such as `your_audio_transcription_openai_whisper-medium_thresh0.60.txt`, which includes the original filename, the model used, and the similarity threshold.
+The output will be saved to a descriptive file, such as `your_audio_transcription_openai_whisper-medium_thresh0.20.txt`, which includes the original filename, the model used, and the similarity threshold.
 
 ### Command-Line Arguments
 
-*   `--model` (optional): Whisper model to use. Default: `openai/whisper-small`. Larger models are more accurate but slower.
+*   `--model` (optional): Whisper model to use. Default: `openai/whisper-large-v3-turbo`. Smaller models are less accurate but faster.
 *   `--language` (optional): Language of the audio (e.g., `french`, `english`). Default: `french`.
 *   `--mode` (optional): Output mode. Can be `subtitle` (default) or `transcription`.
 *   `--file` (optional): Path to the audio file to transcribe. If omitted, the script enters live mode.
@@ -126,9 +127,9 @@ If you find the system is creating too many unique speakers (e.g., `Speaker_3`, 
 *   **The Solution**: To make the system more tolerant and group speakers more effectively, **lower the threshold** using the `--threshold` command-line argument.
 
 ```bash
-python whisperlive.py --file "path/to/your/audio.wav" --threshold 0.55
+python whisperlive.py --file "path/to/your/audio.wav" --threshold 0.4
 ```
-Good values to test are between `0.50` and `0.60`. Experiment to find the best balance for your audio.
+Good values to test are between `0.40` and `0.60`. Experiment to find the best balance for your audio.
 
 ## Contribution
 
