@@ -13,6 +13,11 @@ import numpy as np
 import pyaudio
 import torch
 from dotenv import load_dotenv
+from pyannote.audio import Pipeline
+from pyannote.core import Segment
+from scipy.spatial.distance import cosine
+from speechbrain.inference import SpeakerRecognition
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
 # Suppress specific deprecation warnings from external libraries
 warnings.filterwarnings("ignore", message=".*torchaudio._backend.list_audio_backends.*")
@@ -26,12 +31,6 @@ warnings.filterwarnings(
 
 # Set environment variable to disable HuggingFace symlink warnings
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-
-from pyannote.audio import Pipeline
-from pyannote.core import Segment
-from scipy.spatial.distance import cosine
-from speechbrain.inference import SpeakerRecognition
-from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
 
 class WhisperLiveTranscription:
@@ -74,7 +73,7 @@ class WhisperLiveTranscription:
         print("Loading speaker embedding model...")
         self._load_speaker_embedding_model()
 
-        # --- OPTIMIZATION: Compile models ---
+        # --- Compile models ---
         if self.device.type == "cuda":
             print("Compiling models for performance...")
             self.model = torch.compile(self.model, mode="max-autotune", fullgraph=True)
@@ -85,7 +84,6 @@ class WhisperLiveTranscription:
                 self.embedding_model.mods, mode="max-autotune", fullgraph=True
             )
             print("Models compiled.")
-        # ------------------------------------
 
         print("All models loaded successfully.")
 
@@ -122,13 +120,16 @@ class WhisperLiveTranscription:
         self.last_transcription = ""
         self.last_timestamp = None
 
+        # State for transcription mode merging
+        self.transcription_buffer = {"speaker": None, "timestamp": None, "text": ""}
+
     def _load_diarization_pipeline(self, hf_token):
         """Load the diarization pipeline with proper error handling."""
         try:
             # Updated to use token parameter instead of use_auth_token (deprecated)
             pipeline = Pipeline.from_pretrained(
                 "pyannote/speaker-diarization-3.1",
-                use_auth_token=hf_token if hf_token else True,
+                use_auth_token=hf_token,
             )
             if pipeline is None:
                 raise RuntimeError("Pipeline.from_pretrained returned None.")
@@ -279,6 +280,7 @@ class WhisperLiveTranscription:
     def _audio_stream_context(self, callback=None):
         """Context manager for audio stream handling."""
         p = pyaudio.PyAudio()
+        stream = None
         try:
             if callback:
                 stream = p.open(
@@ -290,11 +292,9 @@ class WhisperLiveTranscription:
                     stream_callback=callback,
                     start=False,
                 )
-            else:
-                stream = None
             yield p, stream
         finally:
-            if "stream" in locals() and stream:
+            if stream:
                 stream.stop_stream()
                 stream.close()
             p.terminate()
@@ -306,11 +306,6 @@ class WhisperLiveTranscription:
 
         # Audio preprocessing
         audio_data = audio_data / (np.max(np.abs(audio_data)) + 1e-8)
-
-        # Simple noise reduction
-        if len(audio_data) > 3:
-            kernel = np.ones(3) / 3
-            audio_data = np.convolve(audio_data, kernel, mode="same")
 
         processed_input = self.processor(
             audio_data, sampling_rate=self.RATE, return_tensors="pt"
@@ -388,7 +383,7 @@ class WhisperLiveTranscription:
                 for segment_info in merged_segments:
                     self._transcribe_and_display(segment_info)
             else:
-                # --- SUBTITLE MODE: Transcribe each segment individually (original behavior) ---
+                # --- SUBTITLE MODE: Transcribe each segment individually ---
                 for turn, _, speaker_label in diarization_result.itertracks(
                     yield_label=True
                 ):
@@ -527,7 +522,6 @@ class WhisperLiveTranscription:
             print(
                 f"DEBUG: Final group with {len(current_group)} segments for {current_group[0]['assigned_speaker']}"
             )
-        # ----------------------------------------------------------------
 
         # --- STEP 3: CREATE FINAL SEGMENTS WITH MERGED AUDIO ---
         for group_idx, group in enumerate(merged_groups):
@@ -576,7 +570,6 @@ class WhisperLiveTranscription:
                 f"DEBUG: Skipping segment too short: {len(speaker_audio_segment)} samples ({len(speaker_audio_segment) / self.RATE:.2f}s)"
             )
             return
-        # ---------------------------------------------------
 
         # --- SIMPLIFIED LOGGING (no embedding calculation needed here) ---
         print(f"DEBUG: Transcribing merged segment for {speaker_label}")
@@ -586,7 +579,6 @@ class WhisperLiveTranscription:
         print(
             f"DEBUG: Audio segment length: {len(speaker_audio_segment)} samples ({len(speaker_audio_segment) / self.RATE:.2f}s)"
         )
-        # ---------------------------------------------------------------
 
         # Transcribe (no need to identify speaker again, it's already done)
         transcription = self._transcribe_segment(speaker_audio_segment)
@@ -601,11 +593,34 @@ class WhisperLiveTranscription:
         elapsed_seconds = chunk_start_time + turn.start
         timestamp = self._calculate_video_timestamp(elapsed_seconds)
 
-        # Format and save
-        line = f"[{timestamp}][{speaker_label}] {transcription}\n"
-        print(f"Live: {line.strip()}")
-        with open(self.filename, "a", encoding="utf-8") as f:
-            f.write(line)
+        # --- LOGIC FOR TRANSCRIPTION MODE ---
+        if self.mode == "transcription":
+            if self.transcription_buffer["speaker"] == speaker_label:
+                # Same speaker, append text
+                self.transcription_buffer["text"] += " " + transcription
+            else:
+                # Different speaker, flush the buffer first
+                self._flush_transcription_buffer()
+                # Start a new buffer for the new speaker
+                self.transcription_buffer["speaker"] = speaker_label
+                self.transcription_buffer["timestamp"] = timestamp
+                self.transcription_buffer["text"] = transcription
+        else:  # Subtitle mode
+            # Format and save immediately
+            line = f"[{timestamp}][{speaker_label}] {transcription}\n"
+            print(f"Live: {line.strip()}")
+            with open(self.filename, "a", encoding="utf-8") as f:
+                f.write(line)
+
+    def _flush_transcription_buffer(self):
+        """Writes the content of the transcription buffer to the file."""
+        if self.transcription_buffer["speaker"] and self.transcription_buffer["text"]:
+            line = f"[{self.transcription_buffer['timestamp']}][{self.transcription_buffer['speaker']}] {self.transcription_buffer['text'].strip()}\n"
+            print(f"Finalized: {line.strip()}")
+            with open(self.filename, "a", encoding="utf-8") as f:
+                f.write(line)
+            # Reset buffer after flushing
+            self.transcription_buffer = {"speaker": None, "timestamp": None, "text": ""}
 
     def transcribe_file(self, file_path):
         """
@@ -674,6 +689,10 @@ class WhisperLiveTranscription:
             print("All segments queued. Waiting for final processing...")
             if hasattr(self, "transcribe_thread"):
                 self.transcribe_thread.join()  # Remove timeout to wait as long as needed
+
+            # Flush any remaining buffered transcription
+            if self.mode == "transcription":
+                self._flush_transcription_buffer()
 
             print(f"\nTranscription finished. Results saved to {self.filename}")
 
@@ -779,7 +798,8 @@ class WhisperLiveTranscription:
         self.pyaudio_instance, self.stream = self.audio_context.__enter__()
 
         print("Starting audio stream...")
-        self.stream.start_stream()
+        if self.stream:
+            self.stream.start_stream()
 
     def stop_recording(self):
         """Stop recording and finalize transcriptions."""
@@ -790,7 +810,7 @@ class WhisperLiveTranscription:
         self.is_running = False
 
         # Stop audio stream
-        if hasattr(self, "stream") and self.stream.is_active():
+        if hasattr(self, "stream") and self.stream and self.stream.is_active():
             self.stream.stop_stream()
         if hasattr(self, "audio_context"):
             self.audio_context.__exit__(None, None, None)
@@ -810,7 +830,11 @@ class WhisperLiveTranscription:
         # Wait for the transcription thread to process all remaining items in the queue
         if hasattr(self, "transcribe_thread"):
             print("Waiting for transcription thread to finish...")
-            self.transcribe_thread.join(timeout=30)  # Increased timeout for safety
+            self.transcribe_thread.join(timeout=120)  # Increased timeout for safety
+
+        # Flush any remaining buffered transcription
+        if self.mode == "transcription":
+            self._flush_transcription_buffer()
 
         print(f"Transcription saved to {self.filename}")
 
@@ -899,6 +923,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    transcriber = None
     try:
         transcriber = WhisperLiveTranscription(
             model_id=args.model,
@@ -927,7 +952,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nStopping process...")
         # Ensure transcriber object exists before trying to use it
-        if "transcriber" in locals():
+        if transcriber:
             # Signal the worker thread to stop its loop
             transcriber.is_running = False
 
@@ -942,7 +967,11 @@ if __name__ == "__main__":
             # Specific cleanup for live mode (stream and audio saving)
             if not args.file:
                 # The stream needs to be explicitly closed if it was running
-                if hasattr(transcriber, "stream") and transcriber.stream.is_active():
+                if (
+                    hasattr(transcriber, "stream")
+                    and transcriber.stream
+                    and transcriber.stream.is_active()
+                ):
                     transcriber.stream.stop_stream()
                 if hasattr(transcriber, "audio_context"):
                     transcriber.audio_context.__exit__(None, None, None)
