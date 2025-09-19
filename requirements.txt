@@ -1,0 +1,7 @@
+numpy
+pyaudio
+python-dotenv
+pyannote.audio
+scipy
+speechbrain
+transformers
