@@ -1080,6 +1080,35 @@ class WhisperLiveTranscription:
         
         return optimal_chunks
 
+    def _generate_filename(self, base_name=None, found_speakers=None):
+        """Generates a standardized filename for the transcription output."""
+        model_name_safe = self.model_id.replace("/", "_")
+        
+        # Use input file's base name or 'live' for microphone input
+        base = os.path.splitext(os.path.basename(base_name))[0] if base_name else "live"
+
+        # Core components
+        parts = [
+            base,
+            self.mode,
+            model_name_safe,
+            self.diarization_method
+        ]
+
+        # Add diarization-specific details
+        if self.diarization_method == 'cluster':
+            parts.append(f"thresh{self.similarity_threshold:.2f}")
+
+        # Add speaker count if available (only in file mode)
+        if found_speakers is not None:
+            parts.append(f"{found_speakers}-speakers")
+        
+        # Add timestamp for live recordings to ensure uniqueness
+        if not base_name:
+            parts.append(datetime.now().strftime('%Y%m%d_%H%M%S'))
+
+        return "_".join(parts) + ".txt"
+
     def transcribe_file(self, file_path):
         """
         Transcribe an entire audio file using the optimal offline approach.
@@ -1231,9 +1260,9 @@ class WhisperLiveTranscription:
             print(f"Diarization complete. Found {found_speakers} unique speakers.")
 
             # Build filename
-            threshold_str = f"thresh{self.similarity_threshold:.2f}"
-            speakers_str = f"_{found_speakers}-speakers"
-            self.filename = f"{base_name}_{self.mode}_{model_name_safe}_{self.diarization_method}_{threshold_str}{speakers_str}.txt"
+            self.filename = self._generate_filename(
+                base_name=file_path, found_speakers=found_speakers
+            )
             self._init_output_file()
 
             # STEP 2: Create optimal chunks for transcription (NEW!)
@@ -1362,7 +1391,7 @@ class WhisperLiveTranscription:
         """Start audio recording and processing."""
         # Set filename for live mode and initialize it
         if self.filename is None:
-            self.filename = f"transcription_{self.mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            self.filename = self._generate_filename()
             self._init_output_file()
 
         if self.mode == "subtitle":
