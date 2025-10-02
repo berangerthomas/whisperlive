@@ -1,38 +1,41 @@
 # Whisper Live Diarization
 
-This project provides a real-time audio transcription solution with speaker diarization, based on the Whisper, Pyannote.audio, and SpeechBrain models. The script can transcribe audio captured from a microphone or process an existing audio file, generating a timestamped transcription file that identifies the different speakers.
+This project provides a real-time audio transcription solution with speaker diarization, based on the Faster-Whisper, Pyannote.audio, and SpeechBrain models. The script can transcribe audio captured from a microphone or process an existing audio file, generating a timestamped transcription file that identifies the different speakers.
 
 ## Features
 
 *   **Dual Processing Modes**:
-    *   **`subtitle` mode**: Generates short, time-accurate segments ideal for live subtitling.
+    *   **`subtitle` mode**: Generates short, time-accurate segments ideal for live subtitling or creating precisely timed subtitle files (e.g., `.srt`).
     *   **`transcription` mode**: Intelligently merges consecutive speech segments from the same speaker to produce a fluid, readable transcript, perfect for reports and documentation.
-*   **Real-Time Transcription**: Transcribes speech live from the microphone.
-*   **File Transcription**: Processes and transcribes long pre-recorded audio files efficiently.
-*   **Speaker Diarization**: Detects who is speaking and when (`pyannote/speaker-diarization-3.1`).
-*   **Speaker Re-identification**: Assigns a unique and consistent ID to each detected speaker, even across audio segments (`speechbrain/spkrec-ecapa-voxceleb`).
-*   **Timestamped Output**: Generates a clean transcription with timestamps and speaker IDs for each speech segment.
-*   **Audio Export**: Saves the entire audio session to a `.wav` file at the end of the recording (live mode only).
-*   **Performance Optimized**: Uses `torch.compile` and `float16` precision on compatible GPUs for maximum performance.
+*   **Flexible Diarization Methods**:
+    *   **`pyannote` (default)**: Uses the powerful `pyannote/speaker-diarization-3.1` pipeline for robust speaker identification.
+    *   **`cluster`**: Uses a VAD (Voice Activity Detection) model for segmentation followed by speaker embedding clustering. This method can be faster and is a great alternative.
+*   **Real-Time & File-Based**: Works seamlessly for live transcription from a microphone and for processing pre-recorded audio files.
+*   **Speaker Re-identification**: Assigns a unique and consistent ID to each detected speaker throughout the session (`speechbrain/spkrec-ecapa-voxceleb`).
+*   **Timestamped Output**: Generates a clean transcription with timestamps and speaker IDs.
+*   **Audio Export**: Saves the entire audio session to a `.wav` file at the end of a live recording.
+*   **Performance Optimized**: Uses `faster-whisper` with `float16` precision on compatible GPUs for maximum performance.
 
 ## Technical Architecture
 
 The system is built around several key technologies:
 
-*   **Transcription Model**: Uses OpenAI's **Whisper** model family via the Hugging Face `transformers` library for high-quality speech recognition.
-*   **Diarization Pipeline**: Employs **`pyannote.audio`** to segment the audio and assign local speaker tags to each turn of speech.
-*   **Speaker Recognition**: Uses **`speechbrain`** (the `spkrec-ecapa-voxceleb` model) to create embeddings (voiceprints) from speech segments. These embeddings are compared to re-identify speakers consistently throughout the session.
-*   **Segment Merging Logic**: A crucial step where speech segments are processed based on the selected mode. In `transcription` mode, consecutive segments from the same identified speaker are merged to form coherent paragraphs, ignoring silence gaps. In `subtitle` mode, segments remain short to ensure precise timing.
-*   **Audio Capture**: Manages the real-time audio stream with **`pyaudio`**, chunking it into segments for processing.
-*   **Parallel Processing**: Uses threads to separate audio capture from transcription, ensuring low latency and a responsive interface.
-*   **Computation**: The script is optimized to use a GPU (CUDA) if available, which significantly speeds up model processing. It also runs on CPU.
+*   **Transcription Model**: Uses the **Whisper** model family via the high-performance `faster-whisper` library.
+*   **Diarization Pipeline**:
+    *   **`pyannote.audio`**: The default method, which segments audio and assigns speaker tags.
+    *   **VAD + Clustering**: An alternative method using Silero VAD for speech detection and `speechbrain` for creating and clustering voiceprints (embeddings).
+*   **Speaker Recognition**: Uses **`speechbrain`** (`spkrec-ecapa-voxceleb`) to create robust voiceprints for speaker identification.
+*   **Segment Merging Logic**: In `transcription` mode, consecutive segments from the same speaker are merged to form coherent paragraphs. In `subtitle` mode, segments remain short for precise timing.
+*   **Audio Capture**: Manages the real-time audio stream with **`pyaudio`**.
+*   **Parallel Processing**: Uses threads to separate audio capture from transcription, ensuring low latency.
+*   **Computation**: Optimized for GPU (CUDA) usage but runs efficiently on CPU as well.
 
 ## Installation
 
 ### Prerequisites
 
-*   Python 3.9+
-*   [uv](https://github.com/astral-sh/uv), an extremely fast Python package installer and resolver.
+*   Python 3.11+
+*   [uv](https://github.com/astral-sh/uv), an extremely fast Python package installer.
 *   **For Linux users**: `portaudio` development files might be needed (`sudo apt-get install portaudio19-dev`).
 
 ### Installation Steps
@@ -44,30 +47,37 @@ The system is built around several key technologies:
     ```
 
 2.  **Create a virtual environment and install dependencies with `uv`:**
-    This command creates a `.venv` virtual environment and installs all dependencies listed in `pyproject.toml`.
     ```bash
     uv venv
     uv sync
     ```
+    This command installs all necessary dependencies for the project.
+
     Then, activate the environment:
-    ```bash
-    source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-    ```
+
+    *   **On Windows:**
+        ```bash
+        .venv\Scripts\activate
+        ```
+    *   **On Linux/macOS:**
+        ```bash
+        source .venv/bin/activate
+        ```
 
 3.  **Install PyTorch (for GPU acceleration):**
-    To benefit from GPU acceleration, install the PyTorch version matching your CUDA version. `uv` can handle this using the appropriate index URL.
+    To benefit from GPU acceleration, install the PyTorch version matching your CUDA version.
     ```bash
     # Example for CUDA 12.1
-    uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+    uv pip install torch --index-url https://download.pytorch.org/whl/cu121
     ```
     If you don't have a GPU, the PyTorch version installed by `uv sync` is sufficient.
 
 4.  **Configure Hugging Face Access:**
     Diarization with `pyannote/speaker-diarization-3.1` requires authentication with Hugging Face.
     *   Create an account on [Hugging Face](https://huggingface.co/).
-    *   Accept the terms of use for the [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) and [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) models on their respective pages.
-    *   Generate an access token in your account settings (with at least `read` permissions).
-    *   Create a `.env` file in the project root and add your token to it:
+    *   Accept the terms of use for [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) and [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0).
+    *   Generate an access token in your account settings (with `read` permissions).
+    *   Create a `.env` file in the project root and add your token:
         ```
         # .env
         HUGGING_FACE_TOKEN="hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxx"
@@ -75,70 +85,89 @@ The system is built around several key technologies:
 
 ## Usage
 
-The script can be run in two modes: live transcription or file processing. The `--mode` argument allows you to choose the output format.
+The script can be run for live transcription or file processing, with different modes and diarization methods.
 
 ### 1. Live Transcription (from microphone)
 
 To start real-time transcription, run the script without the `--file` argument.
 
 ```bash
-# For a fluid, paragraph-style transcript
-python whisperlive.py --model openai/whisper-large-v3-turbo --language english --mode transcription
+# Live subtitles with the fast 'cluster' diarization method
+python whisperlive.py --model small --language fr --mode subtitle --diarization cluster
 
-# For live, time-accurate subtitles
-python whisperlive.py --model openai/whisper-small --language english --mode subtitle
+# Live transcription into paragraphs with the default 'pyannote' method
+python whisperlive.py --model small --language fr --mode transcription
 ```
 
 *   The program will start listening and transcribing.
-*   Press `Ctrl+C` to stop the recording.
-*   Upon stopping, a final transcription (`transcription_YYYYMMDD_HHMMSS.txt`) and an audio file (`audio_YYYYMMDD_HHMMSS.wav`) will be saved.
+*   Press `Ctrl+C` to stop.
+*   A transcription file (`transcription_*.txt`) and an audio recording (`audio_*.wav`) will be saved.
 
 ### 2. Transcription from a File
 
 To transcribe an existing audio file, use the `--file` argument.
 
 ```bash
-# Generate a clean report from a meeting recording
-python whisperlive.py --model openai/whisper-large-v3-turbo --language english --file "path/to/your/audio.wav" --mode transcription --threshold 0.2
+# Generate a clean report from a meeting recording using VAD + clustering
+python whisperlive.py --model large-v3 --language fr --file "path/to/audio.wav" --mode transcription --diarization cluster --threshold 0.7
+
+# Generate a subtitle file using pyannote
+python whisperlive.py --model large-v3 --language fr --file "path/to/audio.wav" --mode subtitle --diarization pyannote
 ```
-The output will be saved to a descriptive file, such as `your_audio_transcription_openai_whisper-medium_thresh0.20.txt`, which includes the original filename, the model used, and the similarity threshold.
+The output will be saved to a descriptive filename, including the original name, mode, model, and diarization settings.
 
 ### Command-Line Arguments
 
-*   `--model` (optional): Whisper model to use. Default: `openai/whisper-large-v3-turbo`. Smaller models are less accurate but faster.
-*   `--language` (optional): Language of the audio (e.g., `french`, `english`). Default: `french`.
-*   `--mode` (optional): Output mode. Can be `subtitle` (default) or `transcription`.
-*   `--file` (optional): Path to the audio file to transcribe. If omitted, the script enters live mode.
-*   `--threshold` (optional): Similarity threshold for speaker identification (0.0 to 1.0). Lower is less strict. Default: `0.60`.
+*   `--model`: Whisper model to use (e.g., `tiny`, `base`, `small`, `medium`, `large-v3`). Default: `large-v3`.
+*   `--language`: Language of the audio (e.g., `fr`, `en`, `es`, etc.). Default: `fr`.
+*   `--mode`: Output mode. `subtitle` (default) for time-accurate segments, or `transcription` for fluid paragraphs.
+*   `--file`: Path to the audio file to transcribe. If omitted, the script enters live mode.
+*   `--diarization`: Speaker diarization method. `pyannote` (default) or `cluster`. The `cluster` method is not available for live transcription mode (`--mode transcription` without `--file`).
+*   `--threshold`: Similarity threshold (0.0 to 1.0) for the `cluster` diarization method. Higher is stricter. Default: `0.7`.
+*   `--min-speakers`, `--max-speakers`: (File mode only) Hint for the number of speakers.
+*   `--enhancement`: Audio enhancement method (`none`, `nsnet2`, `demucs`). Default: `none`.
+
+### Audio Enhancement
+
+You can improve transcription accuracy in noisy environments by applying audio enhancement before processing. This is especially useful for cleaning up background noise or separating voice from music.
+
+Use the `--enhancement` argument with one of the following methods:
+
+-   `none`: (Default) No enhancement is applied.
+-   `nsnet2`: Recommended for **live transcription**. Uses the lightweight and fast NSNet2 model for real-time noise suppression.
+-   `demucs`: Recommended for **file transcription**. Uses the powerful Demucs model to separate vocals from other sounds. It provides very high quality but has significant processing overhead, making it unsuitable for live mode.
+
+**Example (Live Mode with NSNet2):**
+
+```bash
+python whisperlive.py --model large-v3 --enhancement nsnet2
+```
+
+**Example (File Mode with Demucs):**
+
+```bash
+python whisperlive.py --file my_audio.wav --enhancement demucs
+```
 
 ## Configuration and Tuning
 
-### Choosing the Right Mode
+### Choosing the Right Diarization Method
 
-*   Use **`--mode subtitle`** when you need precise timing for each short phrase, such as for creating video subtitles or monitoring a live conversation turn-by-turn.
-*   Use **`--mode transcription`** when your goal is a final, readable document, like a meeting summary or an article. This mode prioritizes text flow over exact timing of short pauses.
+*   **`--diarization pyannote`**: The most robust and accurate method, especially for complex conversations. It is the recommended default.
+*   **`--diarization cluster`**: A faster alternative that uses VAD for speech detection and embedding clustering. It performs very well and can be more efficient, especially in live subtitle mode. It is not available for live transcription mode.
 
-### Adjusting Speaker Identification
+### Adjusting Speaker Identification (`cluster` mode)
 
-If you find the system is creating too many unique speakers (e.g., `Speaker_3`, `Speaker_4` for the same person), the similarity threshold is likely too strict.
+If the `cluster` method creates too many unique speakers (e.g., `SPEAKER_03`, `SPEAKER_04` for the same person), the similarity threshold may be too high.
 
-*   **What it is**: The `similarity_threshold` is a value between 0 and 1 that determines how similar a new voice segment must be to an existing speaker's voiceprint to be matched with them.
-*   **The Problem**: A high threshold is very strict. Minor variations in a person's voice can cause the similarity score to drop below the threshold, creating a new speaker ID unnecessarily.
-*   **The Solution**: To make the system more tolerant and group speakers more effectively, **lower the threshold** using the `--threshold` command-line argument.
+*   **What it is**: The `--threshold` determines how similar a new voice segment must be to an existing speaker's voiceprint to be matched.
+*   **The Solution**: To make the system more tolerant, **lower the threshold**. Good values to test are between `0.6` and `0.8`.
 
 ```bash
-python whisperlive.py --file "path/to/your/audio.wav" --threshold 0.4
+# Use a more tolerant threshold for a file with voice variations
+python whisperlive.py --file "path/to/audio.wav" --diarization cluster --threshold 0.65
 ```
-Good values to test are between `0.40` and `0.60`. Experiment to find the best balance for your audio.
 
 ## Contribution
 
-Contributions to improve this project are welcome. Please follow these steps:
-
-1.  **Fork the project.**
-2.  **Create a feature branch** (`git checkout -b feature/NewFeature`).
-3.  **Commit your changes** (`git commit -m 'Add some NewFeature'`).
-4.  **Push to the branch** (`git push origin feature/NewFeature`).
-5.  **Open a Pull Request.**
-
-Please ensure your code is documented and follows the existing project style.
+Contributions are welcome. Please fork the project, create a feature branch, and open a Pull Request.
