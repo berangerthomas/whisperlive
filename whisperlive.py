@@ -16,7 +16,6 @@ from dotenv import load_dotenv
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
 from pyannote.core import Segment
-from scipy.spatial.distance import cosine
 from speechbrain.inference import SpeakerRecognition
 
 # Suppress specific deprecation warnings from external libraries
@@ -31,6 +30,7 @@ warnings.filterwarnings(
 
 # Set environment variable to disable HuggingFace symlink warnings
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["HF_HUB_LOCAL_DIR_IS_SYMLINK_SUPPORTED"] = "0"
 
 
 class WhisperLiveTranscription:
@@ -38,8 +38,12 @@ class WhisperLiveTranscription:
         self,
         model_id="large-v3",
         language="fr",
-        similarity_threshold=0.2,
+        similarity_threshold=0.7,
         mode="transcription",
+        min_speakers=None,
+        max_speakers=None,
+        diarization_method="pyannote",
+        enhancement_method="none",
     ):
         print("Launching WhisperLiveTranscription...")
 
@@ -47,6 +51,10 @@ class WhisperLiveTranscription:
         self.model_id = model_id
         self.language = language
         self.mode = mode
+        self.min_speakers = min_speakers
+        self.max_speakers = max_speakers
+        self.diarization_method = diarization_method
+        self.enhancement_method = enhancement_method
         self.max_merge_gap = 1.5  # Max silence in seconds between segments to merge
 
         # Load environment variables
@@ -96,14 +104,154 @@ class WhisperLiveTranscription:
         self.is_running = False
         self.start_time = None
 
-        # Output file - Default name for live mode
-        self.filename = (
-            f"transcription_{self.mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        )
-        self._init_output_file()
+        # Output file - Will be set when recording or transcribing starts
+        self.filename = None
 
         # State for transcription mode merging
         self.transcription_buffer = {"speaker": None, "timestamp": None, "text": ""}
+
+        # Audio enhancement models - lazy loading
+        self.nsnet2_session = None
+
+    def _ensure_nsnet2_model_downloaded(self):
+        """Downloads the NSNet2 ONNX model if it doesn't exist."""
+        model_path = "nsnet2-20ms-baseline.onnx"
+        if not os.path.exists(model_path):
+            print("Downloading NSNet2 model...")
+            try:
+                import urllib.request
+                url = "https://github.com/microsoft/DNS-Challenge/raw/master/NSNet2-baseline/nsnet2-20ms-baseline.onnx"
+                urllib.request.urlretrieve(url, model_path)
+                print("NSNet2 model downloaded successfully.")
+            except Exception as e:
+                raise RuntimeError(f"Failed to download NSNet2 model: {e}")
+        return model_path
+
+    def _apply_enhancement(self, audio_data):
+        """Apply selected audio enhancement method."""
+        if self.enhancement_method == "none":
+            return audio_data
+
+        if self.enhancement_method == "nsnet2":
+            if self.nsnet2_session is None:
+                print("Loading NSNet2 denoiser...")
+                try:
+                    import onnxruntime as ort
+                    model_path = self._ensure_nsnet2_model_downloaded()
+                    self.nsnet2_session = ort.InferenceSession(model_path)
+                except ImportError:
+                    warnings.warn("onnxruntime is not installed. Please run 'uv sync'. Skipping enhancement.")
+                    return audio_data
+                except Exception as e:
+                    warnings.warn(f"Failed to load NSNet2 model: {e}. Skipping enhancement.")
+                    return audio_data
+            
+            # Normalize audio to float32, as in the example
+            audio = audio_data.astype(np.float32)
+            if np.max(np.abs(audio)) > 0:
+                audio = audio / np.max(np.abs(audio))
+
+            # NSNet2 processes in 20ms frames (320 samples at 16kHz) with 10ms overlap
+            frame_size = 320
+            hop_size = 160
+            
+            output_audio = []
+            for i in range(0, len(audio) - frame_size, hop_size):
+                frame = audio[i:i+frame_size]
+                
+                # Run inference
+                enhanced_frame = self.nsnet2_session.run(
+                    None, 
+                    {"input": frame.reshape(1, -1)}
+                )[0]
+                
+                # Append the first half (hop_size) of the enhanced frame to avoid overlap issues
+                output_audio.append(enhanced_frame.flatten()[:hop_size])
+            
+            if not output_audio:
+                return np.array([], dtype=np.float32)
+
+            return np.concatenate(output_audio)
+
+        elif self.enhancement_method == "demucs":
+            # Demucs is heavy, so we import and load it only when needed.
+            if self.mode != "transcription" and self.start_time is not None:
+                 warnings.warn("Demucs is not recommended for live processing due to high latency. Using it anyway.")
+            
+            try:
+                from demucs.pretrained import get_model
+                from demucs.apply import apply_model
+                import torchaudio
+            except ImportError as e:
+                print(f"!!! DEMUCS IMPORT FAILED: {e} !!!")
+                warnings.warn("Demucs not installed. Please run 'uv sync'. Skipping enhancement.")
+                return audio_data
+
+            print("Loading Demucs model for audio separation...")
+            demucs_model = get_model('htdemucs')
+            demucs_model.to(self.device)
+            demucs_model.eval()
+            
+            # Demucs expects 44.1kHz, we resample if necessary
+            if self.RATE != 44100:
+                audio_tensor = torch.from_numpy(audio_data).float()
+                if audio_tensor.dim() == 1:
+                    audio_tensor = audio_tensor.unsqueeze(0)
+                
+                resampler = torchaudio.transforms.Resample(
+                    orig_freq=self.RATE,
+                    new_freq=44100
+                ).to(self.device)
+                audio_tensor = resampler(audio_tensor.to(self.device))
+            else:
+                audio_tensor = torch.from_numpy(audio_data).float()
+                if audio_tensor.dim() == 1:
+                    audio_tensor = audio_tensor.unsqueeze(0)
+            
+            # Demucs expects a batch [batch, channels, samples]
+            if audio_tensor.shape[0] == 1:  # mono -> stereo
+                audio_tensor = audio_tensor.repeat(2, 1)
+            
+            audio_tensor = audio_tensor.unsqueeze(0).to(self.device)
+            
+            # Apply the model
+            print("Applying Demucs model...")
+            with torch.no_grad():
+                sources = apply_model(
+                    demucs_model, 
+                    audio_tensor,
+                    split=True,
+                    overlap=0.25
+                )
+            
+            # Demucs returns [batch, stems, channels, samples]
+            vocals = sources[0, 3]  # Take only vocals
+            
+            # Convert to mono by averaging the channels. This is robust.
+            vocals_mono_tensor = vocals.mean(dim=0)
+            
+            # Resample back to the original sample rate
+            if self.RATE != 44100:
+                resampler_back = torchaudio.transforms.Resample(
+                    orig_freq=44100,
+                    new_freq=self.RATE
+                ).to(self.device)
+                vocals_mono_tensor = resampler_back(vocals_mono_tensor.unsqueeze(0)).squeeze()
+
+            # Normalize the final mono vocals tensor to prevent low volume issues
+            max_val = torch.max(torch.abs(vocals_mono_tensor))
+            if max_val > 0:
+                vocals_mono_tensor = vocals_mono_tensor / max_val
+
+            # Ensure the final output is float32 for compatibility with Whisper
+            vocals_mono = vocals_mono_tensor.cpu().numpy().astype(np.float32)
+            
+            print("Demucs processing complete.")
+            return vocals_mono
+
+        else:
+            warnings.warn(f"Audio enhancement method '{self.enhancement_method}' is not yet implemented. Audio will not be processed.")
+            return audio_data
 
     def _load_diarization_pipeline(self, hf_token):
         """Load the diarization pipeline with proper error handling."""
@@ -168,7 +316,11 @@ class WhisperLiveTranscription:
         self.FORMAT = pyaudio.paFloat32
         self.CHANNELS = 1
         self.RATE = 16000
-        self.CHUNK = 1024
+        
+        # VAD model requires specific chunk sizes
+        # For 16kHz: 512 samples = 32ms
+        # For 8kHz: 256 samples = 32ms
+        self.CHUNK = 512  # Changed from 1024 to match VAD requirements
         
         # MODE-SPECIFIC PARAMETERS
         if self.mode == "subtitle":
@@ -181,6 +333,13 @@ class WhisperLiveTranscription:
         # Pre-calculate constants
         self.max_buffer_samples = int(self.MAX_BUFFER_DURATION * self.RATE)
 
+        # VAD parameters for subtitle mode
+        if self.mode == "subtitle":
+            self.VAD_SPEECH_THRESHOLD = 0.5  # Probability threshold for speech
+            self.VAD_SILENCE_DURATION_S = 0.5  # Silence duration to trigger segment cut
+            self.VAD_MIN_SPEECH_DURATION_S = 0.2 # Minimum speech duration to process
+            self.vad_silence_samples = int(self.VAD_SILENCE_DURATION_S * self.RATE)
+
     def _setup_buffers_and_queues(self):
         """Initialize buffers and queues."""
         self.audio_queue = queue.Queue(maxsize=10)
@@ -192,6 +351,12 @@ class WhisperLiveTranscription:
         """Reset audio buffers to empty state."""
         self.audio_buffer = np.array([], dtype=np.float32)
         self.full_audio_buffer_list = []
+        
+        # VAD-specific state for subtitle mode
+        if self.mode == "subtitle":
+            self.vad_speech_buffer = np.array([], dtype=np.float32)
+            self.vad_is_speaking = False
+            self.vad_silence_counter = 0
 
     def _init_output_file(self):
         """Initialize the output transcription file."""
@@ -228,7 +393,8 @@ class WhisperLiveTranscription:
         embedding_norm = embedding_flat / norm
         
         if not self.speaker_embeddings_normalized:
-            speaker_id = f"Speaker_{self.next_speaker_id}"
+            # Format to SPEAKER_00, SPEAKER_01, etc.
+            speaker_id = f"SPEAKER_{self.next_speaker_id - 1:02d}"
             self.speaker_embeddings_normalized[speaker_id] = embedding_norm
             self.next_speaker_id += 1
             print(f"DEBUG: Created new speaker {speaker_id} (first speaker)")
@@ -267,7 +433,7 @@ class WhisperLiveTranscription:
             print(f"DEBUG: Assigned to existing speaker {best_match} and updated their embedding.")
             return best_match
         else:
-            speaker_id = f"Speaker_{self.next_speaker_id}"
+            speaker_id = f"SPEAKER_{self.next_speaker_id - 1:02d}"
             self.speaker_embeddings_normalized[speaker_id] = embedding_norm
             self.next_speaker_id += 1
             print(f"DEBUG: Created new speaker {speaker_id} (similarity too low)")
@@ -305,16 +471,43 @@ class WhisperLiveTranscription:
 
     def _transcribe_segment(self, audio_data):
         """Transcribe audio segment using faster-whisper."""
-        segments, _ = self.model.transcribe(
+        
+        # Calculate maximum duration-based token limit
+        audio_duration = len(audio_data) / self.RATE
+        # Whisper generates ~2 tokens/second on average
+        max_initial_timestamp = audio_duration
+        
+        segments, info = self.model.transcribe(
             audio_data,
             language=self.language,
             task="transcribe",
             beam_size=5,
-            temperature=0.0,
-            log_prob_threshold=-1.0,
+            temperature=0.0,  # Back to deterministic
+            condition_on_previous_text=False,  # Explicitly disable context
+            compression_ratio_threshold=2.4,  # Default value
+            log_prob_threshold=-1.0,  # More permissive
             no_speech_threshold=0.6,
+            initial_prompt=None,  # No prompt bias
+            prefix=None,  # No prefix
+            suppress_blank=True,  # Suppress blank outputs
+            suppress_tokens=[-1],  # Suppress only special tokens
+            without_timestamps=False,  # Keep timestamps for validation
+            max_initial_timestamp=max_initial_timestamp,  # Limit based on audio duration
+            word_timestamps=False,
+            prepend_punctuations="\"'¿([{-",
+            append_punctuations="\"'.。,，!！?？:：)]}、",
         )
-        return "".join(segment.text for segment in segments).strip()
+        
+        # Collect segments and check for repetition
+        result_text = ""
+        for segment in segments:
+            # Validate that segment timestamp doesn't exceed audio duration
+            if segment.end > audio_duration + 1.0:  # Allow 1s margin
+                print(f"WARNING: Segment timestamp {segment.end:.2f}s exceeds audio duration {audio_duration:.2f}s - truncating")
+                break
+            result_text += segment.text
+        
+        return result_text.strip()
 
     def _add_audio_segment(self, chunk_id, audio_data, start_time, end_time):
         """Add audio segment to result queue."""
@@ -362,44 +555,22 @@ class WhisperLiveTranscription:
                 f.flush()
 
     def _process_transcription(self, chunk_id, audio_data, is_final=False):
-        """Process a chunk of audio: diarize, identify, and transcribe."""
-        print(f"Processing segment {chunk_id}...")
-
+        """
+        Process a chunk of audio: diarize, identify, and transcribe.
+        This method acts as a router, choosing the diarization method based on mode.
+        """
         try:
-            diarization_result = self.diarization_pipeline(
-                {
-                    "waveform": torch.from_numpy(audio_data).unsqueeze(0),
-                    "sample_rate": self.RATE,
-                }
-            )
-
-            segments_list = list(diarization_result.itertracks(yield_label=True))
-            unique_speakers = set(speaker_label for _, _, speaker_label in segments_list)
-
-            print(
-                f"Found {len(segments_list)} speech segments from {len(unique_speakers)} speakers in segment {chunk_id}"
-            )
-
-            # --- MODE SELECTION LOGIC ---
-            if self.mode == "transcription":
-                # --- TRANSCRIPTION MODE: Merge segments before transcribing ---
-                merged_segments = self._merge_speaker_segments(
-                    segments_list, audio_data
-                )
-                for segment_info in merged_segments:
-                    self._transcribe_and_display(segment_info)
+            # For live subtitle mode with cluster method, we bypass pyannote.
+            is_live_mode = self.start_time is not None
+            if (
+                is_live_mode
+                and self.mode == "subtitle"
+                and self.diarization_method == "cluster"
+            ):
+                self._process_transcription_cluster(chunk_id, audio_data)
             else:
-                # --- SUBTITLE MODE: Transcribe each segment individually ---
-                for turn, _, speaker_label in segments_list:
-                    speaker_audio_segment = audio_data[
-                        int(turn.start * self.RATE) : int(turn.end * self.RATE)
-                    ]
-                    segment_info = {
-                        "speaker_label": speaker_label,
-                        "turn": turn,
-                        "audio_segment": speaker_audio_segment,
-                    }
-                    self._transcribe_and_display(segment_info)
+                # All other cases (file mode, or pyannote in live mode) use pyannote.
+                self._process_transcription_pyannote(chunk_id, audio_data)
 
         except Exception:
             print(f"Error during transcription of segment {chunk_id}:")
@@ -407,6 +578,77 @@ class WhisperLiveTranscription:
         finally:
             if chunk_id in self.chunk_timestamps:
                 del self.chunk_timestamps[chunk_id]
+
+    def _process_transcription_cluster(self, chunk_id, audio_data):
+        """Processes a chunk using VAD segmentation and embedding comparison (live mode)."""
+        print(f"DEBUG: Processing segment {chunk_id} with live 'cluster' method.")
+
+        # The audio_data is already a speech segment from VAD in subtitle mode.
+        # We just need to get its embedding and identify the speaker.
+        try:
+            audio_tensor = (
+                torch.from_numpy(audio_data).float().unsqueeze(0).to(self.device)
+            )
+            embedding_tensor = self.embedding_model.encode_batch(audio_tensor)
+            embedding_np = embedding_tensor.squeeze().cpu().numpy()
+        except Exception as e:
+            print(f"DEBUG: Could not get embedding for segment {chunk_id}: {e}")
+            return
+
+        assigned_speaker = self._get_speaker_id(embedding_np)
+        if assigned_speaker is None:
+            print(f"DEBUG: Could not assign speaker for segment {chunk_id}.")
+            return
+
+        print(f"DEBUG: Identified segment {chunk_id} as {assigned_speaker}")
+
+        # --- Logic adapted from _transcribe_and_display ---
+
+        # VAD has already been applied in the audio callback, so we skip it here.
+        min_duration = 0.5
+        min_samples = int(min_duration * self.RATE)
+
+        if len(audio_data) < min_samples:
+            print(
+                f"DEBUG: Skipping segment too short: {len(audio_data)} samples ({len(audio_data) / self.RATE:.2f}s)"
+            )
+            return
+
+        transcription = self._transcribe_segment(audio_data)
+        if not transcription or transcription.isspace():
+            print("DEBUG: Transcription was empty or whitespace only")
+            return
+
+        chunk_start_time = self.chunk_timestamps.get(chunk_id, {}).get("start", 0)
+        # The 'turn' starts at 0 relative to the chunk
+        elapsed_seconds = chunk_start_time
+        timestamp = self._calculate_video_timestamp(elapsed_seconds)
+
+        # This live method is only for subtitle mode, so we write directly.
+        line = f"[{timestamp}][{assigned_speaker}] {transcription}\n"
+        print(f"Live: {line.strip()}")
+        self._write_to_file(line, force_flush=True)
+
+    def _process_transcription_pyannote(self, chunk_id, audio_data):
+        """Processes a chunk using pyannote for diarization."""
+        print(f"Processing segment {chunk_id} with 'pyannote' method...")
+        diarization_result = self.diarization_pipeline(
+            {
+                "waveform": torch.from_numpy(audio_data).unsqueeze(0),
+                "sample_rate": self.RATE,
+            }
+        )
+
+        segments_list = list(diarization_result.itertracks(yield_label=True))
+        unique_speakers = set(speaker_label for _, _, speaker_label in segments_list)
+
+        print(
+            f"Found {len(segments_list)} speech segments from {len(unique_speakers)} speakers in segment {chunk_id}"
+        )
+
+        merged_segments = self._merge_speaker_segments(segments_list, audio_data)
+        for segment_info in merged_segments:
+            self._transcribe_and_display(segment_info)
 
     def _merge_speaker_segments(self, segments_list, audio_data):
         """Two-step approach with batch embedding extraction for better performance."""
@@ -517,12 +759,13 @@ class WhisperLiveTranscription:
                     current_segment["turn"].start - last_segment_in_group["turn"].end
                 )
 
-                if self.mode == "transcription":
-                    should_merge = same_speaker
-                    gap_reason = f"gap: {time_gap:.2f}s (ignored in transcription mode)"
-                else:
-                    should_merge = same_speaker and time_gap < self.max_merge_gap
-                    gap_reason = f"gap: {time_gap:.2f}s (limit: {self.max_merge_gap}s)"
+                # In subtitle mode, we merge if the gap is small.
+                # In transcription mode (file-based), this function is called on the whole file,
+                # so we only care about merging consecutive segments from the same speaker, regardless of gap.
+                should_merge = same_speaker and (
+                    self.mode == "transcription" or time_gap < self.max_merge_gap
+                )
+                gap_reason = f"gap: {time_gap:.2f}s (limit: {self.max_merge_gap}s)"
 
                 print(
                     f"DEBUG: Comparing segment {current_segment['turn'].start:.2f}s ({current_segment['assigned_speaker']}) with last in group {last_segment_in_group['turn'].end:.2f}s ({last_segment_in_group['assigned_speaker']}) - {gap_reason}"
@@ -587,7 +830,10 @@ class WhisperLiveTranscription:
         speaker_label = segment_info["speaker_label"]
         speaker_audio_segment = segment_info["audio_segment"]
 
-        speaker_audio_segment = self._apply_vad(speaker_audio_segment)
+        # Apply VAD only in live mode, and not when pyannote is already doing the segmentation
+        is_live_mode = self.start_time is not None
+        if is_live_mode and self.diarization_method != "pyannote":
+            speaker_audio_segment = self._apply_vad(speaker_audio_segment)
 
         min_duration = 0.5
         min_samples = int(min_duration * self.RATE)
@@ -605,6 +851,23 @@ class WhisperLiveTranscription:
         print(
             f"DEBUG: Audio segment length: {len(speaker_audio_segment)} samples ({len(speaker_audio_segment) / self.RATE:.2f}s)"
         )
+
+        # DEBUG: Export problematic segment for inspection
+        if turn.start >= 1.5 and turn.start <= 1.6:
+            import wave
+            debug_filename = f"debug_segment_{turn.start:.2f}s_{turn.end:.2f}s.wav"
+            print(f"DEBUG: Exporting problematic segment to {debug_filename}")
+            max_val = np.max(np.abs(speaker_audio_segment))
+            if max_val > 0:
+                scaled = np.int16(speaker_audio_segment / max_val * 32767.0)
+            else:
+                scaled = np.int16(speaker_audio_segment)
+            with wave.open(debug_filename, "wb") as wf:
+                wf.setnchannels(self.CHANNELS)
+                wf.setsampwidth(2)
+                wf.setframerate(self.RATE)
+                wf.writeframes(scaled.tobytes())
+            print(f"DEBUG: Segment exported. Max amplitude: {max_val:.6f}")
 
         transcription = self._transcribe_segment(speaker_audio_segment)
         if not transcription or transcription.isspace():
@@ -639,16 +902,130 @@ class WhisperLiveTranscription:
             self._write_to_file(line, force_flush=True)
             self.transcription_buffer = {"speaker": None, "timestamp": None, "text": ""}
 
+    def _create_optimal_transcription_chunks(self, segments_with_speakers, audio_data):
+        """
+        Create optimal chunks (1-2 minutes) from speaker segments for transcription.
+        
+        Strategy:
+        1. Group consecutive segments from the same speaker
+        2. Cut at natural pauses (silence) when approaching 90 seconds
+        3. Never exceed 120 seconds
+        4. Return chunks ready for transcription
+        """
+        TARGET_DURATION = 90.0  # Start looking for cut point after 90s
+        MAX_DURATION = 120.0     # Hard limit
+        MIN_SILENCE_GAP = 0.5    # Minimum silence to consider as cut point
+        
+        optimal_chunks = []
+        current_chunk = {
+            "speaker": None,
+            "start_time": None,
+            "segments": [],
+            "duration": 0.0
+        }
+        
+        print(f"\nCreating optimal transcription chunks from {len(segments_with_speakers)} segments...")
+        
+        for i, segment_info in enumerate(segments_with_speakers):
+            speaker = segment_info["speaker_label"]
+            turn = segment_info["turn"]
+            audio_segment = segment_info["audio_segment"]
+            segment_duration = turn.end - turn.start
+            
+            # Check if we need to start a new chunk
+            should_cut = False
+            cut_reason = ""
+            
+            if current_chunk["speaker"] is None:
+                # First segment - start new chunk
+                should_cut = False
+            elif current_chunk["speaker"] != speaker:
+                # Speaker change - always cut
+                should_cut = True
+                cut_reason = "speaker change"
+            elif current_chunk["duration"] + segment_duration > MAX_DURATION:
+                # Would exceed hard limit - must cut
+                should_cut = True
+                cut_reason = f"max duration ({MAX_DURATION}s)"
+            elif current_chunk["duration"] > TARGET_DURATION:
+                # Past target duration - look for silence
+                if i < len(segments_with_speakers) - 1:
+                    next_segment = segments_with_speakers[i + 1]
+                    gap = next_segment["turn"].start - turn.end
+                    if gap >= MIN_SILENCE_GAP:
+                        should_cut = True
+                        cut_reason = f"natural pause ({gap:.2f}s silence)"
+        
+            if should_cut and current_chunk["segments"]:
+                # Finalize current chunk
+                chunk_start = current_chunk["segments"][0]["turn"].start
+                chunk_end = current_chunk["segments"][-1]["turn"].end
+                chunk_audio = np.concatenate([s["audio_segment"] for s in current_chunk["segments"]])
+                
+                optimal_chunks.append({
+                    "speaker_label": current_chunk["speaker"],
+                    "turn": Segment(chunk_start, chunk_end),
+                    "audio_segment": chunk_audio,
+                    "num_segments": len(current_chunk["segments"])
+                })
+                
+                print(f"  ✓ Chunk {len(optimal_chunks)}: {current_chunk['speaker']} "
+                      f"[{chunk_start:.1f}s-{chunk_end:.1f}s] duration={current_chunk['duration']:.1f}s "
+                      f"({len(current_chunk['segments'])} segments) - Cut reason: {cut_reason}")
+                
+                # Reset for new chunk
+                current_chunk = {
+                    "speaker": None,
+                    "start_time": None,
+                    "segments": [],
+                    "duration": 0.0
+                }
+            
+            # Add segment to current chunk
+            if current_chunk["speaker"] is None:
+                current_chunk["speaker"] = speaker
+                current_chunk["start_time"] = turn.start
+            
+            current_chunk["segments"].append(segment_info)
+            current_chunk["duration"] += segment_duration
+        
+        # Don't forget the last chunk
+        if current_chunk["segments"]:
+            chunk_start = current_chunk["segments"][0]["turn"].start
+            chunk_end = current_chunk["segments"][-1]["turn"].end
+            chunk_audio = np.concatenate([s["audio_segment"] for s in current_chunk["segments"]])
+            
+            optimal_chunks.append({
+                "speaker_label": current_chunk["speaker"],
+                "turn": Segment(chunk_start, chunk_end),
+                "audio_segment": chunk_audio,
+                "num_segments": len(current_chunk["segments"])
+            })
+            
+            print(f"  ✓ Chunk {len(optimal_chunks)}: {current_chunk['speaker']} "
+                  f"[{chunk_start:.1f}s-{chunk_end:.1f}s] duration={current_chunk['duration']:.1f}s "
+                  f"({len(current_chunk['segments'])} segments) - Final chunk")
+        
+        print(f"\nCreated {len(optimal_chunks)} optimal chunks (avg duration: "
+              f"{np.mean([c['turn'].end - c['turn'].start for c in optimal_chunks]):.1f}s)")
+        
+        return optimal_chunks
+
     def transcribe_file(self, file_path):
-        """Transcribe an entire audio file by chunking it and processing it like a live stream."""
+        """
+        Transcribe an entire audio file using the optimal offline approach.
+        Uses pyannote for full-file diarization, then creates optimal chunks for Whisper.
+        """
         base_name = os.path.splitext(os.path.basename(file_path))[0]
         model_name_safe = self.model_id.replace("/", "_")
-        threshold_str = f"thresh{self.similarity_threshold:.2f}"
-        self.filename = f"{base_name}_{self.mode}_{model_name_safe}_{threshold_str}.txt"
-        self._init_output_file()
 
-        print(f"Transcribing audio file: {file_path}")
+        self.filename = None
+
+        print(f"Transcribing audio file (offline mode): {file_path}")
+        print(f"Using diarization method: {self.diarization_method}")
+
         try:
+            # Load audio file
             with wave.open(file_path, "rb") as wf:
                 framerate = wf.getframerate()
                 if framerate != self.RATE:
@@ -656,60 +1033,154 @@ class WhisperLiveTranscription:
                         f"Unsupported sample rate: {framerate}. Please use {self.RATE} Hz."
                     )
                 audio_bytes = wf.readframes(wf.getnframes())
+            audio_float32 = (
+                np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            )
+            print("Audio file loaded.")
 
-            audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
-            audio_float32 = audio_int16.astype(np.float32) / 32768.0
+            # Apply audio enhancement if selected
+            audio_float32 = self._apply_enhancement(audio_float32)
 
-            print("Audio file loaded. Starting transcription process...")
-
-            self.is_running = True
-            self.transcribe_thread = threading.Thread(target=self._transcribe_audio)
-            self.transcribe_thread.daemon = True
-            self.transcribe_thread.start()
-
-            # Use mode-specific buffer duration
-            chunk_duration_seconds = self.MAX_BUFFER_DURATION
-            chunk_samples = int(chunk_duration_seconds * self.RATE)
-            total_samples = len(audio_float32)
-
-            print(f"Using {chunk_duration_seconds}s chunks for {self.mode} mode")
-
-            for i in range(0, total_samples, chunk_samples):
-                # Check if interrupted by Ctrl+C
-                if not self.is_running:
-                    print("Interruption detected, stopping file queuing...")
-                    break
+            # Save cleaned audio if an enhancement method was used
+            if self.enhancement_method != "none":
+                cleaned_filename = f"{base_name}_{self.enhancement_method}_cleaned.wav"
+                print(f"\nSaving cleaned audio to {cleaned_filename}...")
                 
-                start_sample = i
-                end_sample = i + chunk_samples
-                chunk_data = audio_float32[start_sample:end_sample]
+                # Scale to int16
+                max_val = np.max(np.abs(audio_float32))
+                if max_val > 0:
+                    scaled_audio = np.int16(audio_float32 / max_val * 32767.0)
+                else:
+                    scaled_audio = np.int16(audio_float32)
 
-                if len(chunk_data) == 0:
-                    continue
+                # Write to WAV file
+                with wave.open(cleaned_filename, "wb") as wf:
+                    wf.setnchannels(self.CHANNELS)
+                    wf.setsampwidth(2)  # 2 bytes for int16
+                    wf.setframerate(self.RATE)
+                    wf.writeframes(scaled_audio.tobytes())
+                print("Cleaned audio saved.")
 
-                start_time = start_sample / self.RATE
-                end_time = end_sample / self.RATE
-
-                self._add_audio_segment(
-                    self.chunk_counter, chunk_data, start_time, end_time
+            # STEP 1: Diarization (pyannote processes the entire file)
+            if self.diarization_method == "pyannote":
+                print("\n" + "*"*10 + " Step 1: Diarizing with pyannote (full file)... " + "*"*10)
+                diarization_params = {}
+                if self.min_speakers is not None:
+                    diarization_params["min_speakers"] = self.min_speakers
+                if self.max_speakers is not None:
+                    diarization_params["max_speakers"] = self.max_speakers
+                
+                diarization_result = self.diarization_pipeline(
+                    {"waveform": torch.from_numpy(audio_float32).unsqueeze(0), "sample_rate": self.RATE},
+                    **diarization_params
                 )
-                print(
-                    f"Queued segment {self.chunk_counter - 1} ({start_time:.2f}s to {end_time:.2f}s)"
+                segments_list = list(diarization_result.itertracks(yield_label=True))
+                print(f"Pyannote found {len(segments_list)} speech segments.")
+
+                # Convert to our format with audio data
+                segments_with_speakers = [
+                    {
+                        "speaker_label": speaker_label,
+                        "turn": turn,
+                        "audio_segment": audio_float32[int(turn.start * self.RATE):int(turn.end * self.RATE)],
+                    }
+                    for turn, _, speaker_label in segments_list
+                ]
+                found_speakers = len(set(seg["speaker_label"] for seg in segments_with_speakers))
+
+            else:  # cluster method - same as before
+                print("\n" + "*"*10 + " Step 1: Segmenting speech with Silero VAD... " + "*"*10)
+                self._ensure_vad_loaded()
+                (get_speech_timestamps, _, _, _, _) = self.vad_utils
+                speech_timestamps = get_speech_timestamps(
+                    torch.from_numpy(audio_float32), self.vad_model, sampling_rate=self.RATE
                 )
-                # Give the worker thread a moment to catch up
-                time.sleep(0.1)
+                print(f"VAD found {len(speech_timestamps)} speech segments.")
 
-            self.is_running = False
+                print("\n" + "*"*10 + " Step 2: Identifying speakers with clustering... " + "*"*10)
+                # [Le code de clustering reste identique]
+                try:
+                    from sklearn.cluster import AgglomerativeClustering
+                    from sklearn.preprocessing import normalize
+                except ImportError:
+                    raise ImportError("scikit-learn is required. Please run: pip install scikit-learn")
 
-            print("All segments queued. Waiting for final processing...")
-            if hasattr(self, "transcribe_thread"):
-                self.transcribe_thread.join()
+                valid_segments_info = []
+                audio_segments_for_batch = []
+                for ts in speech_timestamps:
+                    start_samples, end_samples = ts["start"], ts["end"]
+                    audio_segment = audio_float32[start_samples:end_samples]
+                    if len(audio_segment) < self.RATE * 0.5: continue
+                    
+                    valid_segments_info.append({
+                        "turn": Segment(start_samples / self.RATE, end_samples / self.RATE),
+                        "audio_segment": audio_segment
+                    })
+                    audio_segments_for_batch.append(audio_segment)
 
-            if self.mode == "transcription":
-                self._flush_transcription_buffer()
+                if not valid_segments_info:
+                    segments_with_speakers, found_speakers = [], 0
+                else:
+                    try:
+                        max_len = max(len(seg) for seg in audio_segments_for_batch)
+                        padded_segments = [np.pad(seg, (0, max_len - len(seg)), mode="constant") if len(seg) < max_len else seg for seg in audio_segments_for_batch]
+                        batch_tensor = torch.stack([torch.from_numpy(seg).float() for seg in padded_segments]).to(self.device)
+                        all_embeddings = self.embedding_model.encode_batch(batch_tensor).cpu().numpy()
+                    except Exception:
+                        all_embeddings_list = []
+                        for seg_audio in audio_segments_for_batch:
+                            try:
+                                embedding = self.embedding_model.encode_batch(torch.from_numpy(seg_audio).float().unsqueeze(0).to(self.device)).cpu().numpy()
+                                all_embeddings_list.append(embedding)
+                            except Exception:
+                                pass
+                        all_embeddings = np.concatenate(all_embeddings_list, axis=0) if all_embeddings_list else np.array([])
 
-            self._write_to_file("", force_flush=True)
+                    if all_embeddings.size == 0:
+                        segments_with_speakers, found_speakers = [], 0
+                    else:
+                        # Ensure embeddings are 2D [num_segments, embedding_dim]
+                        if all_embeddings.ndim == 3 and all_embeddings.shape[1] == 1:
+                            all_embeddings = all_embeddings.squeeze(1)
 
+                        normalized_embeddings = normalize(all_embeddings, norm="l2", axis=1)
+                        clustering = AgglomerativeClustering(
+                            n_clusters=self.max_speakers if self.max_speakers else None,
+                            metric="cosine", linkage="average",
+                            distance_threshold=1 - self.similarity_threshold if not self.max_speakers else None
+                        ).fit(normalized_embeddings)
+                        
+                        cluster_labels = clustering.labels_
+                        found_speakers = len(set(cluster_labels))
+                        
+                        segments_with_speakers = [{
+                            "speaker_label": f"SPEAKER_{label:02d}",
+                            "turn": info["turn"],
+                            "audio_segment": info["audio_segment"]
+                        } for info, label in zip(valid_segments_info, cluster_labels)]
+
+            print(f"Diarization complete. Found {found_speakers} unique speakers.")
+
+            # Build filename
+            threshold_str = f"thresh{self.similarity_threshold:.2f}"
+            speakers_str = f"_{found_speakers}-speakers"
+            self.filename = f"{base_name}_{self.mode}_{model_name_safe}_{self.diarization_method}_{threshold_str}{speakers_str}.txt"
+            self._init_output_file()
+
+            # STEP 2: Create optimal chunks for transcription (NEW!)
+            print("\n" + "*"*10 + " Step 2: Creating optimal transcription chunks... " + "*"*10)
+            optimal_chunks = self._create_optimal_transcription_chunks(segments_with_speakers, audio_float32)
+
+            # STEP 3: Transcribe optimal chunks
+            print("\n" + "*"*10 + " Step 3: Transcribing chunks... " + "*"*10)
+            self.chunk_timestamps[0] = {"start": 0, "end": len(audio_float32) / self.RATE}
+            
+            for chunk_info in optimal_chunks:
+                self._transcribe_and_display(chunk_info)
+
+            # Final flush
+            self._flush_transcription_buffer()
+            self._write_to_file("\n# Transcription complete.\n", force_flush=True)
             print(f"\nTranscription finished. Results saved to {self.filename}")
 
         except FileNotFoundError:
@@ -717,6 +1188,9 @@ class WhisperLiveTranscription:
         except Exception as e:
             print(f"An error occurred during file transcription: {e}")
             traceback.print_exc()
+        finally:
+            if 0 in self.chunk_timestamps:
+                del self.chunk_timestamps[0]
 
     def _transcribe_audio(self):
         """Audio transcription worker thread."""
@@ -734,36 +1208,97 @@ class WhisperLiveTranscription:
                 traceback.print_exc()
 
     def _process_audio_stream(self, in_data, frame_count, time_info, status):
-        """Audio stream callback - accumulate and cut on buffer limit."""
+        """Audio stream callback."""
         now = datetime.now()
         chunk = np.frombuffer(in_data, dtype=np.float32)
-        self.audio_buffer = np.concatenate([self.audio_buffer, chunk])
-        self.full_audio_buffer_list.append(chunk)
-
-        buffer_len = len(self.audio_buffer)
         
-        # Cut when buffer reaches target duration (mode-specific)
-        if buffer_len >= self.max_buffer_samples:
-            buffer_duration = buffer_len / self.RATE
+        # Apply audio enhancement if selected
+        chunk = self._apply_enhancement(chunk)
+        
+        self.full_audio_buffer_list.append(chunk)  # Always save full audio
+
+        if self.mode == "subtitle":
+            self._process_subtitle_mode(chunk, now)
+        else:  # transcription mode
+            self._process_transcription_mode(chunk, now)
+
+        return (in_data, pyaudio.paContinue)
+
+    def _process_subtitle_mode(self, chunk, now):
+        """Process audio chunk for subtitle mode using VAD."""
+        # VAD expects a torch tensor - make a copy to ensure writability
+        chunk_tensor = torch.from_numpy(np.copy(chunk))
+        speech_prob = self.vad_model(chunk_tensor, self.RATE).item()
+
+        if speech_prob > self.VAD_SPEECH_THRESHOLD:
+            # Speech detected
+            self.vad_silence_counter = 0
+            if not self.vad_is_speaking:
+                print("VAD: Speech started")
+                self.vad_is_speaking = True
+            self.vad_speech_buffer = np.concatenate([self.vad_speech_buffer, chunk])
+        else:
+            # Silence detected
+            if self.vad_is_speaking:
+                self.vad_silence_counter += len(chunk)
+                if self.vad_silence_counter >= self.vad_silence_samples:
+                    print(
+                        f"VAD: Speech ended (silence duration: {self.vad_silence_counter / self.RATE:.2f}s)"
+                    )
+
+                    # Process the captured speech segment if it's long enough
+                    if (
+                        len(self.vad_speech_buffer) / self.RATE
+                        > self.VAD_MIN_SPEECH_DURATION_S
+                    ):
+                        buffer_duration = len(self.vad_speech_buffer) / self.RATE
+                        timestamp_start = (
+                            now - timedelta(seconds=buffer_duration)
+                        ).timestamp()
+
+                        print(
+                            f"→ VAD cut: sending {buffer_duration:.2f}s segment for processing"
+                        )
+                        self._add_audio_segment(
+                            self.chunk_counter,
+                            self.vad_speech_buffer,
+                            timestamp_start,
+                            now.timestamp(),
+                        )
+                    else:
+                        print("VAD: Skipping segment, too short.")
+
+                    # Reset state
+                    self.vad_speech_buffer = np.array([], dtype=np.float32)
+                    self.vad_is_speaking = False
+                    self.vad_silence_counter = 0
+
+    def _process_transcription_mode(self, chunk, now):
+        """Process audio chunk for transcription mode (fixed buffer)."""
+        self.audio_buffer = np.concatenate([self.audio_buffer, chunk])
+        if len(self.audio_buffer) >= self.max_buffer_samples:
+            buffer_duration = len(self.audio_buffer) / self.RATE
             timestamp_start = (now - timedelta(seconds=buffer_duration)).timestamp()
-            
-            mode_label = "subtitle (real-time)" if self.mode == "subtitle" else "transcription (coherence)"
-            print(f"→ Buffer reached {buffer_duration:.1f}s ({mode_label}), sending to pyannote")
-            
+
+            print(f"→ Buffer full: sending {buffer_duration:.1f}s segment for processing")
             self._add_audio_segment(
                 self.chunk_counter,
                 self.audio_buffer,
                 timestamp_start,
                 now.timestamp(),
             )
-
-            # Reset buffer completely
             self.audio_buffer = np.array([], dtype=np.float32)
-
-        return (in_data, pyaudio.paContinue)
 
     def start_recording(self):
         """Start audio recording and processing."""
+        # Set filename for live mode and initialize it
+        if self.filename is None:
+            self.filename = f"transcription_{self.mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            self._init_output_file()
+
+        if self.mode == "subtitle":
+            self._ensure_vad_loaded()
+
         self.is_running = True
         self.start_time = datetime.now()
         self._reset_buffers()
@@ -849,14 +1384,21 @@ class WhisperLiveTranscription:
 
 if __name__ == "__main__":
     MODELS = [
+        "tiny.en",
         "tiny",
+        "base.en",
         "base",
+        "small.en",
         "small",
+        "medium.en",
         "medium",
-        "large",
+        "large-v1",
         "large-v2",
         "large-v3",
-        "large-v3-turbo",
+        "large",
+        "distil-large-v2",
+        "distil-medium.en",
+        "distil-small.en"
     ]
 
     parser = argparse.ArgumentParser(
@@ -885,8 +1427,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.20,
-        help="Similarity threshold for speaker identification (0.0 to 1.0). Lower is less strict.",
+        default=0.7,
+        help="Similarity threshold for speaker identification (0.0 to 1.0). Higher is stricter. Used in 'subtitle' mode or with '--diarization cluster'.",
     )
     parser.add_argument(
         "--mode",
@@ -895,8 +1437,50 @@ if __name__ == "__main__":
         default="subtitle",
         help='Processing mode: "subtitle" for real-time display, "transcription" for merged, fluid text.',
     )
+    parser.add_argument(
+        "--min-speakers",
+        type=int,
+        default=None,
+        help="Minimum number of speakers to detect (optional). Used only in file mode.",
+    )
+    parser.add_argument(
+        "--max-speakers",
+        type=int,
+        default=None,
+        help="Maximum number of speakers to detect (optional). Used only in file mode.",
+    )
+    parser.add_argument(
+        "--diarization",
+        type=str,
+        choices=["pyannote", "cluster"],
+        default="pyannote",
+        help="Speaker diarization method. 'pyannote' is the default. 'cluster' uses VAD and speaker embeddings, and is available for file transcription or live subtitle mode.",
+    )
+    parser.add_argument(
+        "--enhancement",
+        type=str,
+        choices=["none", "nsnet2", "demucs"],
+        default="none",
+        help="Audio enhancement method to apply before transcription.",
+    )
 
     args = parser.parse_args()
+
+    # --- Argument Validation ---
+    if (args.min_speakers is not None or args.max_speakers is not None) and not args.file:
+        parser.error("--min-speakers and --max-speakers can only be used in file mode (--file).")
+
+    if not args.file and args.mode == "transcription" and args.diarization == "cluster":
+        parser.error(
+            "In live mode (no --file), '--diarization cluster' is only compatible with '--mode subtitle'."
+        )
+
+    default_threshold = parser.get_default("threshold")
+    if args.diarization == "pyannote" and args.threshold != default_threshold:
+        warnings.warn(
+            "Warning: --threshold is only used with '--diarization cluster'."
+        )
+    # -------------------------
 
     transcriber = None
     try:
@@ -905,6 +1489,10 @@ if __name__ == "__main__":
             language=args.language,
             similarity_threshold=args.threshold,
             mode=args.mode,
+            min_speakers=args.min_speakers,
+            max_speakers=args.max_speakers,
+            diarization_method=args.diarization,
+            enhancement_method=args.enhancement,
         )
 
         if args.file:
@@ -940,7 +1528,8 @@ if __name__ == "__main__":
                     transcriber._flush_transcription_buffer()
                 
                 # Forcer l'écriture de tout le buffer fichier
-                transcriber._write_to_file("", force_flush=True)
+                if transcriber.filename:
+                    transcriber._write_to_file("", force_flush=True)
                 
             else:
                 # Mode live : utiliser stop_recording() qui fait tout le nettoyage
