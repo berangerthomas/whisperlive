@@ -23,15 +23,17 @@ Segment-based transcription can cause the model to generate repetitive or nonsen
 -   **Mechanism**: This padding provides a clean, unambiguous acoustic context for the model's encoder. It effectively resets the model's attention state, preventing it from carrying over erroneous patterns from a previous chunk's boundary.
 -   **Timestamp Integrity**: The timestamps for the final transcription are calculated based on the original, un-padded audio segment's position in the stream, ensuring that this internal processing step does not affect the final temporal accuracy.
 
+While not described in a formal publication, this technique is a practical method for improving the robustness of segment-based transcription.
+
 ### 3. Speaker Diarization Methodologies
 
 The tool offers two distinct methods for speaker identification:
 
--   **`pyannote` (Default)**: This method uses the pre-trained, end-to-end `pyannote/speaker-diarization-3.1` pipeline. It is a comprehensive model that performs speech segmentation, embedding extraction, and clustering in a single step, offering high accuracy, especially in conversations with overlapping speech.
+-   **`pyannote` (Default)**: This method uses the pre-trained, end-to-end `pyannote/speaker-diarization-3.1` pipeline [[2]](#2). It is a comprehensive model that performs speech segmentation, embedding extraction, and clustering in a single step, offering high accuracy, especially in conversations with overlapping speech.
 
 -   **`cluster`**: This is a multi-step, manual pipeline:
-    1.  **Voice Activity Detection (VAD)**: The audio is first segmented into speech and non-speech regions using the `Silero-VAD` model.
-    2.  **Speaker Embedding**: For each speech segment, a fixed-dimensional vector representation (an embedding, or "voiceprint") is extracted using the `speechbrain/spkrec-ecapa-voxceleb` model.
+    1.  **Voice Activity Detection (VAD)**: The audio is first segmented into speech and non-speech regions using the `Silero-VAD` model [[4]](#4).
+    2.  **Speaker Embedding**: For each speech segment, a fixed-dimensional vector representation (an embedding, or "voiceprint") is extracted using the `speechbrain/spkrec-ecapa-voxceleb` model, which is based on the ECAPA-TDNN architecture [[3]](#3).
     3.  **Clustering**: All embeddings are grouped using agglomerative clustering based on cosine similarity to identify the unique speakers.
 
 ### 4. Intelligent Chunking for File Processing
@@ -80,7 +82,7 @@ This method ensures that each chunk sent for transcription contains coherent con
 | Argument | Default | Description |
 |---|---|---|
 | `--language <lang>` | `fr` | Language code (e.g., `en`, `es`, `de`). |
-| `--model <id>` | `large-v3` | Whisper model. Choices: `tiny`, `base`, `small`, `medium`, `large-v1/v2/v3`, and distilled variants. |
+| `--model <id>` | `large-v3` | Whisper model [[1]](#1). Choices: `tiny`, `base`, `small`, `medium`, `large-v1/v2/v3`, and distilled variants. |
 | `--file <path>` | `None` | Path to a `.wav` file. If omitted, runs in live mode. |
 | `--mode <mode>` | `subtitle` | Output mode. Choices: `subtitle`, `transcription`. |
 | `--diarization <method>` | `pyannote` | Diarization method. Choices: `pyannote`, `cluster`. |
@@ -89,7 +91,7 @@ This method ensures that each chunk sent for transcription contains coherent con
 | `--max-speakers <int>` | `None` | **(File mode only)** Hint for the maximum number of speakers. |
 | `--transcription-engine <engine>` | `auto` | Engine. Choices: `auto`, `faster-whisper`, `transformers`. |
 | `--auto-engine-threshold <float>` | `15.0` | **(Auto mode only)** Time in seconds to switch from `transformers` to `faster-whisper`. |
-| `--enhancement <method>` | `none` | Audio enhancement. Choices: `none`, `nsnet2`, `demucs`. |
+| `--enhancement <method>` | `none` | Audio enhancement. Choices: `none`, `nsnet2` [[6]](#6), `demucs` [[5]](#5). |
 
 ## Usage Scenarios
 
@@ -181,6 +183,15 @@ All transcriptions are saved to a `.txt` file with a name generated from the con
     1.  Ensure the GPU-accelerated version of PyTorch is installed and being utilized.
     2.  Use a smaller model (e.g., `--model medium` or `--model small`).
     3.  For clean audio, force the faster engine with `--transcription-engine faster-whisper`.
+
+## Bibliography
+
+1.  <a name="1"></a>Radford, A., Kim, J. W., Xu, T., Brockman, G., McLeavey, C., & Sutskever, I. (2022). *Robust Speech Recognition via Large-Scale Weak Supervision*. [arXiv:2212.04356](https://arxiv.org/abs/2212.04356).
+2.  <a name="2"></a>Bredin, H., Yin, R., Coria, J. M., Gelly, G., Korshunov, P., Lavechin, M., Fustes, D., Titeux, H., Bouaziz, W., & Gill, M. (2020). *pyannote.audio: neural building blocks for speaker diarization*. [arXiv:1911.01255](https://arxiv.org/abs/1911.01255).
+3.  <a name="3"></a>Desplanques, B., Thienpondt, J., & Demuynck, K. (2020). *ECAPA-TDNN: Emphasized Channel Attention, Propagation and Aggregation in TDNN Based Speaker Verification*. [arXiv:2005.07143](https://arxiv.org/abs/2005.07143).
+4.  <a name="4"></a>Silero Team. (2024). *Silero VAD: pre-trained enterprise-grade Voice Activity Detector (VAD), Number Detector and Language Classifier*. [GitHub repository](https://github.com/snakers4/silero-vad).
+5.  <a name="5"></a>Défossez, A., Usunier, N., Bottou, L., & Bach, F. (2019). *Music Source Separation in the Waveform Domain*. [arXiv:1911.13254](https://arxiv.org/abs/1911.13254).
+6.  <a name="6"></a>Braun, S., Gamper, H., Reddy, C. K. A., & Cutler, R. (2021). *Towards efficient models for real-time deep noise suppression*. In *ICASSP 2021 - 2021 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)*.
 
 ## License
 
