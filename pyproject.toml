@@ -16,4 +16,5 @@ dependencies = [
     "faster-whisper==0.10.0",
     "demucs>=4.0.1",
     "soundfile>=0.13.1",
+    "transformers>=4.39.3",
 ]
