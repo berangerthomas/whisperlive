@@ -44,6 +44,8 @@ class WhisperLiveTranscription:
         max_speakers=None,
         diarization_method="pyannote",
         enhancement_method="none",
+        transcription_engine="auto",  # NEW: "auto", "faster-whisper", "transformers"
+        auto_engine_threshold=15.0,   # NEW: threshold in seconds for auto mode
     ):
         print("Launching WhisperLiveTranscription...")
 
@@ -55,6 +57,8 @@ class WhisperLiveTranscription:
         self.max_speakers = max_speakers
         self.diarization_method = diarization_method
         self.enhancement_method = enhancement_method
+        self.transcription_engine = transcription_engine  # NEW
+        self.auto_engine_threshold = auto_engine_threshold  # NEW
         self.max_merge_gap = 1.5  # Max silence in seconds between segments to merge
 
         # Load environment variables
@@ -65,12 +69,8 @@ class WhisperLiveTranscription:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
 
-        # Load Whisper model
-        print("Loading faster-whisper model...")
-        compute_type = "float16" if self.device.type == "cuda" else "float32"
-        self.model = WhisperModel(
-            model_id, device=self.device.type, compute_type=compute_type
-        )
+        # Load Whisper model(s) based on engine choice
+        self._load_transcription_models()  # MODIFIED
 
         # Load diarization pipeline
         print("Loading diarization model...")
@@ -470,45 +470,131 @@ class WhisperLiveTranscription:
             p.terminate()
 
     def _transcribe_segment(self, audio_data):
-        """Transcribe audio segment using faster-whisper."""
+        """
+        Transcribe audio segment with intelligent engine selection.
         
-        # Calculate maximum duration-based token limit
+        Strategy:
+        - Auto mode: Use transformers for short segments (< threshold), faster-whisper for long segments
+        - Manual mode: Use the specified engine
+        """
         audio_duration = len(audio_data) / self.RATE
-        # Whisper generates ~2 tokens/second on average
-        max_initial_timestamp = audio_duration
         
-        segments, info = self.model.transcribe(
+        # Protection: Don't transcribe very short segments
+        if audio_duration < 0.5:
+            print(f"DEBUG: Segment too short ({audio_duration:.2f}s), skipping")
+            return ""
+        
+        # Determine which engine to use
+        if self.transcription_engine == "auto":
+            # Intelligent selection based on duration and configured threshold
+            use_transformers = audio_duration < self.auto_engine_threshold
+            engine_name = "transformers" if use_transformers else "faster-whisper"
+            print(f"DEBUG: Auto-selecting {engine_name} for {audio_duration:.2f}s segment (threshold: {self.auto_engine_threshold}s)")
+        elif self.transcription_engine == "transformers":
+            use_transformers = True
+            engine_name = "transformers"
+        else:  # faster-whisper
+            use_transformers = False
+            engine_name = "faster-whisper"
+        
+        # Transcribe with selected engine
+        if use_transformers:
+            return self._transcribe_with_transformers(audio_data, audio_duration)
+        else:
+            return self._transcribe_with_faster_whisper(audio_data, audio_duration)
+
+    def _transcribe_with_faster_whisper(self, audio_data, audio_duration):
+        """Transcribe with faster-whisper (optimized for speed, with anti-repetition)."""
+        segments, info = self.faster_whisper_model.transcribe(
             audio_data,
             language=self.language,
             task="transcribe",
             beam_size=5,
-            temperature=0.0,  # Back to deterministic
-            condition_on_previous_text=False,  # Explicitly disable context
-            compression_ratio_threshold=2.4,  # Default value
-            log_prob_threshold=-1.0,  # More permissive
+            
+            # Anti-repetition parameters
+            repetition_penalty=1.2,
+            no_repeat_ngram_size=5,
+            
+            # Temperature and sampling
+            temperature=0.0,
+            
+            # Context management
+            condition_on_previous_text=False,
+            initial_prompt="Transcription précise et naturelle sans répétitions.",
+            
+            # Quality thresholds
+            compression_ratio_threshold=2.4,
+            log_prob_threshold=-1.0,
             no_speech_threshold=0.6,
-            initial_prompt=None,  # No prompt bias
-            prefix=None,  # No prefix
-            suppress_blank=True,  # Suppress blank outputs
-            suppress_tokens=[-1],  # Suppress only special tokens
-            without_timestamps=False,  # Keep timestamps for validation
-            max_initial_timestamp=max_initial_timestamp,  # Limit based on audio duration
+            
+            # Token control
+            prefix=None,
+            suppress_blank=True,
+            suppress_tokens=[-1],
+            
+            # Timestamp management
+            without_timestamps=False,
+            max_initial_timestamp=audio_duration,
             word_timestamps=False,
+            
             prepend_punctuations="\"'¿([{-",
             append_punctuations="\"'.。,，!！?？:：)]}、",
         )
         
-        # Collect segments and check for repetition
-        result_text = ""
-        for segment in segments:
-            # Validate that segment timestamp doesn't exceed audio duration
-            if segment.end > audio_duration + 1.0:  # Allow 1s margin
-                print(f"WARNING: Segment timestamp {segment.end:.2f}s exceeds audio duration {audio_duration:.2f}s - truncating")
-                break
-            result_text += segment.text
+        result_text = "".join(segment.text for segment in segments).strip()
         
-        return result_text.strip()
+        # Post-processing: detect and warn about potential repetitions
+        if result_text:
+            words = result_text.split()
+            if len(words) > 10:
+                unique_ratio = len(set(words)) / len(words)
+                if unique_ratio < 0.3:
+                    print(f"WARNING: High repetition detected (unique ratio: {unique_ratio:.2f}) in faster-whisper output")
+                    print(f"  → Consider lowering --auto-engine-threshold (current: {self.auto_engine_threshold}s)")
+        
+        return result_text
 
+    def _transcribe_with_transformers(self, audio_data, audio_duration):
+        """Transcribe with transformers (more stable for short segments)."""
+        # Normalize audio
+        audio_normalized = audio_data / (np.max(np.abs(audio_data)) + 1e-8)
+        
+        # Process input
+        processed_input = self.transformers_processor(
+            audio_normalized,
+            sampling_rate=self.RATE,
+            return_tensors="pt"
+        )
+        features = processed_input.input_features.to(self.device)
+        
+        # Create attention mask
+        attention_mask = torch.ones(
+            features.shape[:-1], dtype=torch.long, device=self.device
+        )
+        
+        # Generate with anti-repetition
+        predicted_ids = self.transformers_model.generate(
+            features,
+            attention_mask=attention_mask,
+            language=self.language,
+            task="transcribe",
+            max_length=448,
+            num_beams=5,
+            repetition_penalty=1.2,
+            no_repeat_ngram_size=5,
+            # Remove conflicting parameters:
+            # - do_sample and temperature cause a warning (removed)
+            # - suppress_tokens conflicts with forced_decoder_ids (removed)
+            # - forced_decoder_ids is deprecated (removed)
+        )
+        
+        transcription = self.transformers_processor.batch_decode(
+            predicted_ids,
+            skip_special_tokens=True
+        )[0].strip()
+        
+        return transcription
+    
     def _add_audio_segment(self, chunk_id, audio_data, start_time, end_time):
         """Add audio segment to result queue."""
         self.chunk_timestamps[chunk_id] = {"start": start_time, "end": end_time}
@@ -830,48 +916,22 @@ class WhisperLiveTranscription:
         speaker_label = segment_info["speaker_label"]
         speaker_audio_segment = segment_info["audio_segment"]
 
-        # Apply VAD only in live mode, and not when pyannote is already doing the segmentation
-        is_live_mode = self.start_time is not None
-        if is_live_mode and self.diarization_method != "pyannote":
-            speaker_audio_segment = self._apply_vad(speaker_audio_segment)
-
         min_duration = 0.5
         min_samples = int(min_duration * self.RATE)
 
         if len(speaker_audio_segment) < min_samples:
             print(
-                f"DEBUG: Skipping segment too short: {len(speaker_audio_segment)} samples ({len(speaker_audio_segment) / self.RATE:.2f}s)"
+                f"DEBUG: Skipping segment too short: {len(speaker_audio_segment)} samples ({len(speaker_audio_segment) / self.RATE:.2f}s) at {turn.start:.2f}s"
             )
             return
 
-        print(f"DEBUG: Transcribing merged segment for {speaker_label}")
-        print(
-            f"DEBUG: Turn: {turn.start:.2f}s -> {turn.end:.2f}s (duration: {turn.end - turn.start:.2f}s)"
-        )
-        print(
-            f"DEBUG: Audio segment length: {len(speaker_audio_segment)} samples ({len(speaker_audio_segment) / self.RATE:.2f}s)"
-        )
-
-        # DEBUG: Export problematic segment for inspection
-        if turn.start >= 1.5 and turn.start <= 1.6:
-            import wave
-            debug_filename = f"debug_segment_{turn.start:.2f}s_{turn.end:.2f}s.wav"
-            print(f"DEBUG: Exporting problematic segment to {debug_filename}")
-            max_val = np.max(np.abs(speaker_audio_segment))
-            if max_val > 0:
-                scaled = np.int16(speaker_audio_segment / max_val * 32767.0)
-            else:
-                scaled = np.int16(speaker_audio_segment)
-            with wave.open(debug_filename, "wb") as wf:
-                wf.setnchannels(self.CHANNELS)
-                wf.setsampwidth(2)
-                wf.setframerate(self.RATE)
-                wf.writeframes(scaled.tobytes())
-            print(f"DEBUG: Segment exported. Max amplitude: {max_val:.6f}")
+        print(f"DEBUG: Transcribing chunk for {speaker_label} [{turn.start:.2f}s - {turn.end:.2f}s]")
+        print(f"DEBUG: Audio segment length: {len(speaker_audio_segment)} samples ({len(speaker_audio_segment) / self.RATE:.2f}s)")
 
         transcription = self._transcribe_segment(speaker_audio_segment)
+
         if not transcription or transcription.isspace():
-            print("DEBUG: Transcription was empty or whitespace only")
+            print(f"DEBUG: Transcription was empty or whitespace only for segment at {turn.start:.2f}s")
             return
 
         chunk_start_time = self.chunk_timestamps.get(self.chunk_counter - 1, {}).get(
@@ -905,16 +965,10 @@ class WhisperLiveTranscription:
     def _create_optimal_transcription_chunks(self, segments_with_speakers, audio_data):
         """
         Create optimal chunks (1-2 minutes) from speaker segments for transcription.
-        
-        Strategy:
-        1. Group consecutive segments from the same speaker
-        2. Cut at natural pauses (silence) when approaching 90 seconds
-        3. Never exceed 120 seconds
-        4. Return chunks ready for transcription
         """
-        TARGET_DURATION = 90.0  # Start looking for cut point after 90s
-        MAX_DURATION = 120.0     # Hard limit
-        MIN_SILENCE_GAP = 0.5    # Minimum silence to consider as cut point
+        TARGET_DURATION = 90.0
+        MAX_DURATION = 120.0
+        MIN_SILENCE_GAP = 0.5
         
         optimal_chunks = []
         current_chunk = {
@@ -925,6 +979,21 @@ class WhisperLiveTranscription:
         }
         
         print(f"\nCreating optimal transcription chunks from {len(segments_with_speakers)} segments...")
+        
+        # DEBUG: Log all input segments to detect gaps
+        print("\nDEBUG: Input segments from pyannote:")
+        for i, segment_info in enumerate(segments_with_speakers):
+            turn = segment_info["turn"]
+            speaker = segment_info["speaker_label"]
+            duration = turn.end - turn.start
+            print(f"  Segment {i}: {speaker} [{turn.start:.2f}s - {turn.end:.2f}s] duration={duration:.2f}s")
+            
+            # Check for gaps
+            if i > 0:
+                prev_turn = segments_with_speakers[i-1]["turn"]
+                gap = turn.start - prev_turn.end
+                if gap > 5.0:  # Gap > 5 seconds
+                    print(f"    ⚠️  GAP DETECTED: {gap:.2f}s silence before this segment")
         
         for i, segment_info in enumerate(segments_with_speakers):
             speaker = segment_info["speaker_label"]
@@ -1381,6 +1450,94 @@ class WhisperLiveTranscription:
             f"Audio saved ({len(self.full_audio_buffer) / self.RATE:.2f}s) to {filename}"
         )
 
+    def _load_transcription_models(self):
+        """Load transcription model(s) based on engine configuration."""
+        if self.transcription_engine in ["faster-whisper", "auto"]:
+            print("Loading faster-whisper model...")
+            compute_type = "float16" if self.device.type == "cuda" else "float32"
+            self.faster_whisper_model = WhisperModel(
+                self.model_id, device=self.device.type, compute_type=compute_type
+            )
+        else:
+            self.faster_whisper_model = None
+
+        if self.transcription_engine in ["transformers", "auto"]:
+            print("Loading transformers Whisper model...")
+            from transformers import WhisperForConditionalGeneration, WhisperProcessor
+            
+            model_name = f"openai/whisper-{self.model_id}"
+            self.transformers_processor = WhisperProcessor.from_pretrained(model_name)
+            self.transformers_model = WhisperForConditionalGeneration.from_pretrained(
+                model_name
+            ).to(self.device)
+            
+            if self.device.type == "cuda":
+                self.transformers_model = self.transformers_model.half()
+        else:
+            self.transformers_processor = None
+            self.transformers_model = None
+
+        # Log the configuration
+        if self.transcription_engine == "auto":
+            print(f"Auto-selection enabled: segments <{self.auto_engine_threshold}s will use transformers, ≥{self.auto_engine_threshold}s will use faster-whisper")
+        elif self.transcription_engine == "faster-whisper":
+            print("Using faster-whisper for all segments")
+        else:
+            print("Using transformers for all segments")
+
+        # Set default model reference for compatibility
+        if self.transcription_engine == "faster-whisper":
+            self.model = self.faster_whisper_model
+        elif self.transcription_engine == "transformers":
+            self.model = self.transformers_model
+        else:  # auto
+            self.model = self.faster_whisper_model  # Default for non-transcription uses
+
+    def _transcribe_segment(self, audio_data):
+        """
+        Transcribe audio segment with intelligent engine selection.
+        
+        Strategy:
+        - Auto mode: Use transformers for short segments (< threshold), faster-whisper for long segments
+        - Manual mode: Use the specified engine
+        """
+        audio_duration = len(audio_data) / self.RATE
+        
+        # Protection: Don't transcribe very short segments
+        if audio_duration < 0.5:
+            print(f"DEBUG: Segment too short ({audio_duration:.2f}s), skipping")
+            return ""
+        
+        # IMPORTANT: Add silence padding to improve transcription quality
+        # This prevents hallucinations at segment boundaries
+        padding_duration = 1.5  # 1500ms of silence
+        padding_samples = int(padding_duration * self.RATE)
+        silence_padding = np.zeros(padding_samples, dtype=np.float32)
+        
+        # Pad audio with silence at start and end
+        padded_audio = np.concatenate([silence_padding, audio_data, silence_padding])
+        padded_duration = len(padded_audio) / self.RATE
+        
+        print(f"DEBUG: Original duration: {audio_duration:.2f}s, padded duration: {padded_duration:.2f}s")
+        
+        # Determine which engine to use
+        if self.transcription_engine == "auto":
+            # Use original duration (not padded) for threshold decision
+            use_transformers = audio_duration < self.auto_engine_threshold
+            engine_name = "transformers" if use_transformers else "faster-whisper"
+            print(f"DEBUG: Auto-selecting {engine_name} for {audio_duration:.2f}s segment (threshold: {self.auto_engine_threshold}s)")
+        elif self.transcription_engine == "transformers":
+            use_transformers = True
+            engine_name = "transformers"
+        else:  # faster-whisper
+            use_transformers = False
+            engine_name = "faster-whisper"
+        
+        # Transcribe with selected engine using PADDED audio
+        if use_transformers:
+            return self._transcribe_with_transformers(padded_audio, padded_duration)
+        else:
+            return self._transcribe_with_faster_whisper(padded_audio, padded_duration)
 
 if __name__ == "__main__":
     MODELS = [
@@ -1463,6 +1620,30 @@ if __name__ == "__main__":
         default="none",
         help="Audio enhancement method to apply before transcription.",
     )
+    parser.add_argument(
+        "--transcription-engine",
+        type=str,
+        choices=["auto", "faster-whisper", "transformers"],
+        default="auto",
+        help=(
+            "Transcription engine to use. "
+            "'auto' (default): intelligently selects based on segment duration and --auto-engine-threshold. "
+            "'faster-whisper': always use faster-whisper (faster but may repeat on short segments). "
+            "'transformers': always use transformers (slower but more stable)."
+        ),
+    )
+    parser.add_argument(
+        "--auto-engine-threshold",
+        type=float,
+        default=15.0,
+        help=(
+            "Duration threshold in seconds for auto engine selection (default: 15.0). "
+            "Segments shorter than this will use transformers (more stable), "
+            "longer segments will use faster-whisper (faster). "
+            "Only used when --transcription-engine is 'auto'. "
+            "Recommended range: 10-30 seconds."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1480,6 +1661,13 @@ if __name__ == "__main__":
         warnings.warn(
             "Warning: --threshold is only used with '--diarization cluster'."
         )
+    
+    # Validation: warn if threshold is specified but engine is not auto
+    if args.auto_engine_threshold != parser.get_default("auto_engine_threshold") and args.transcription_engine != "auto":
+        warnings.warn(
+            f"Warning: --auto-engine-threshold={args.auto_engine_threshold} will be ignored "
+            f"because --transcription-engine is set to '{args.transcription_engine}' (not 'auto')."
+        )
     # -------------------------
 
     transcriber = None
@@ -1493,6 +1681,8 @@ if __name__ == "__main__":
             max_speakers=args.max_speakers,
             diarization_method=args.diarization,
             enhancement_method=args.enhancement,
+            transcription_engine=args.transcription_engine,  # NEW
+            auto_engine_threshold=args.auto_engine_threshold,  # NEW
         )
 
         if args.file:
