@@ -3,12 +3,17 @@ name = "whisperlive"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = [
     "pyannote-audio>=3.4.0",
     "pyaudio>=0.2.14",
     "python-dotenv>=1.1.1",
     "speechbrain>=1.0.3",
     "torch>=2.8.0",
-    "transformers>=4.56.1",
+    "torchaudio",
+    "onnxruntime",
+    "ctranslate2>=4.0.0,<5.0.0",
+    "faster-whisper==0.10.0",
+    "demucs>=4.0.1",
+    "soundfile>=0.13.1",
 ]
